@@ -29,24 +29,11 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 /**
  * \file RaspiVid.c
- * Command line program to capture a camera video stream and encode it to file.
- * Also optionally display a preview/viewfinder of current camera input.
- *
- * Description
- *
- * 3 components are created; camera, preview and video encoder.
- * Camera component has three ports, preview, video and stills.
- * This program connects preview and video to the preview and video
- * encoder. Using mmal we don't need to worry about buffers between these
- * components, but we do need to handle buffers from the encoder, which
- * are simply written straight to the file in the requisite buffer callback.
- *
- * If raw option is selected, a video splitter component is connected between
- * camera and preview. This allows us to set up callback for raw camera data
- * (in YUV420 or RGB format) which might be useful for further image processing.
- *
- * We use the RaspiCamControl code to handle the specific camera settings.
- * We use the RaspiPreview code to handle the (generic) preview window
+ * Программа для Raspberry Pi Zero для работы с терминалом CAN-WAY. Сырой вариант, в котором пока реализовано
+ * получение фотографии и снятие видео. Видео и фотографии получаются одного разрешения,
+ * поскольку используется сплиттер, подключенный к камере. Сплиттер имеет два выхода.
+ * Один выход подключается к энкодеру для получения видео в формате H264,
+ * второй выход подключается к энкодеру для получения фотографий в формате JPEG. 
  */
 
 // We use some GNU extensions (basename)
@@ -177,6 +164,13 @@ typedef struct
     FILE *file_handle;                   /// File handle to write buffer data to.
     VCOS_SEMAPHORE_T complete_semaphore; /// semaphore which is posted when we reach end of frame (indicates end of capture or fault)
     RASPIVID_STATE *pstate;              /// pointer to our state in case required in callback
+    MMAL_POOL_T *encoderPool;
+    unsigned char *data;
+    unsigned int bufferPosition;
+    unsigned int startingOffset;
+    unsigned int offset;
+    unsigned int length;
+    unsigned int lengthActual;
 } PORT_USERDATA_IMAGE;
 
 /** Possible raw output formats
@@ -781,6 +775,7 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
     if (pData)
     {
         int bytes_written = buffer->length;
+        // printf("Buffer length in callback: %d \n", bytes_written);
         int64_t current_time = get_microseconds64() / 1000;
 
         vcos_assert(pData->file_handle);
@@ -918,6 +913,7 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
             }
             if (buffer->length)
             {
+                // printf("DEBUG_BUF\n");
                 mmal_buffer_header_mem_lock(buffer);
                 if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_CODECSIDEINFO)
                 {
@@ -1981,25 +1977,42 @@ static void encoder_buffer_callback_image(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_
 
     if (pData)
     {
-        int bytes_written = buffer->length;
-
-        if (buffer->length && pData->file_handle)
+        unsigned int flags = buffer->flags;
+        pData->lengthActual += buffer->length;
+        mmal_buffer_header_mem_lock(buffer);
+        for (unsigned int i = 0; i < buffer->length; i++, pData->bufferPosition++)
         {
-            mmal_buffer_header_mem_lock(buffer);
-
-            bytes_written = fwrite(buffer->data, 1, buffer->length, pData->file_handle);
-
-            mmal_buffer_header_mem_unlock(buffer);
+            if (pData->offset >= pData->length)
+            {
+                printf("Buffer provided was too small! Failed to copy data into buffer\n");
+                break;
+            }
+            else
+            {
+                pData->data[pData->offset] = buffer->data[i];
+                pData->offset++;
+            }
         }
+        mmal_buffer_header_mem_unlock(buffer);
+        // int bytes_written = buffer->length;
 
-        // We need to check we wrote what we wanted - it's possible we have run out of storage.
-        if (bytes_written != buffer->length)
-        {
-            vcos_log_error("Unable to write buffer to file - aborting!!!");
-            complete = 1;
-        }
+        // if (buffer->length && pData->file_handle)
+        // {
+        //     mmal_buffer_header_mem_lock(buffer);
 
-        // Now flag if we have completed
+        //     bytes_written = fwrite(buffer->data, 1, buffer->length, pData->file_handle);
+
+        //     mmal_buffer_header_mem_unlock(buffer);
+        // }
+
+        // // We need to check we wrote what we wanted - it's possible we have run out of storage.
+        // if (bytes_written != buffer->length)
+        // {
+        //     vcos_log_error("Unable to write buffer to file - aborting!!!");
+        //     complete = 1;
+        // }
+
+        // // Now flag if we have completed
         if (buffer->flags & (MMAL_BUFFER_HEADER_FLAG_FRAME_END | MMAL_BUFFER_HEADER_FLAG_TRANSMISSION_FAILED))
             complete = 1;
     }
@@ -2007,10 +2020,8 @@ static void encoder_buffer_callback_image(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_
     {
         vcos_log_error("Received a encoder buffer callback with no state");
     }
-
     // release buffer back to the pool
     mmal_buffer_header_release(buffer);
-
     // and send one back to the port (if still open)
     if (port->is_enabled)
     {
@@ -2026,7 +2037,6 @@ static void encoder_buffer_callback_image(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_
         if (!new_buffer || status != MMAL_SUCCESS)
             vcos_log_error("Unable to return a buffer to the encoder port");
     }
-
     if (complete)
         vcos_semaphore_post(&(pData->complete_semaphore));
 }
@@ -2038,8 +2048,9 @@ int start_recording(RASPIVID_STATE *state)
     MMAL_PORT_T *encoder_output_port = state->encoder_component->output[0];
     MMAL_PORT_T *splitter_output_port = state->splitter_component->output[SPLITTER_OUTPUT_PORT];
     MMAL_PORT_T *encoder_input_port = state->encoder_component->input[0];
-    if (&state->encoder_connection == NULL)
+    if (!state->encoder_connection->is_enabled)
     {
+        printf("Enable the encoder connection!\n");
         status = connect_ports(splitter_output_port, encoder_input_port, &state->encoder_connection);
         if (status != MMAL_SUCCESS)
         {
@@ -2048,25 +2059,32 @@ int start_recording(RASPIVID_STATE *state)
             // goto error;
         }
     }
+    else
+        printf("Encoder connection is already enabled\n");
     // Set up our video userdata - this is passed through to the callback where we need the information.
     state->callback_data.pstate = state;
     state->callback_data.abort = 0;
     state->callback_data.file_handle = NULL;
     // state->common_settings.filename = malloc(max_filename_length);
-    strncpy(state->common_settings.filename, "video1.h264", max_filename_length);
+    // strncpy(state->common_settings.filename, "video1.h264", max_filename_length);
     state->callback_data.file_handle = fopen(state->common_settings.filename, "wb");
-
     if (!state->callback_data.file_handle)
     {
         // Notify user, carry on but discarding encoded output buffers
         vcos_log_error("%s: Error opening output file: %s\nNo output file will be generated\n", __func__, state->common_settings.filename);
         return -1;
     }
-    //!!!
     // Set up our userdata - this is passed through to the callback where we need the information.
     encoder_output_port->userdata = (struct MMAL_PORT_USERDATA_T *)&state->callback_data;
+    if (encoder_output_port->is_enabled)
+    {
+        printf("Could not enable encoder output port. Try waiting longer before attempting to take another record\n");
+        return -1;
+    }
     // Enable the encoder output port and tell it its callback function
     status = mmal_port_enable(encoder_output_port, encoder_buffer_callback);
+    if (status != MMAL_SUCCESS)
+        return -1;
     // Send all the buffers to the encoder output port
     if (state->callback_data.file_handle)
     {
@@ -2075,7 +2093,6 @@ int start_recording(RASPIVID_STATE *state)
         for (q = 0; q < num; q++)
         {
             MMAL_BUFFER_HEADER_T *buffer = mmal_queue_get(state->encoder_pool->queue);
-
             if (!buffer)
             {
                 vcos_log_error("Unable to get a required buffer %d from pool queue", q);
@@ -2103,29 +2120,100 @@ int stop_recording(RASPIVID_STATE *state)
     mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 0);
     fprintf(stderr, "Finished capture\n");
     check_disable_port(encoder_output_port);
-    if (state->encoder_connection)
-        mmal_connection_destroy(state->encoder_connection);
+    if (state->encoder_connection->is_enabled)
+    {
+        status = mmal_connection_destroy(state->encoder_connection);
+        if (status == MMAL_SUCCESS)
+            printf("Encoder connection was destroyed\n");
+        else
+            printf("Encoder connection was not destroyed\n");
+    }
+    fclose(state->callback_data.file_handle);
     // Clear callback userdata
+    // encoder_output_port->userdata = (struct MMAL_PORT_USERDATA_T *){0};
     state->callback_data = (const PORT_USERDATA){0};
     return 0;
 }
 
-// int take_picture(RASPIVID_STATE *state)
-// {
-//     int status;
-//     MMAL_PORT_T *splitter_image_port = state->splitter_component->output[1];
-//     MMAL_PORT_T *encoder_input_port_image = state->encoder_component_image->input[0];
-//     MMAL_PORT_T *encoder_output_port_image = state->encoder_component_image->output[0];
-//     status = connect_ports(splitter_image_port, encoder_input_port_image, &state->encoder_connection_image);
-//     if (status != MMAL_SUCCESS)
-//     {
-//         state->encoder_connection_image = NULL;
-//         vcos_log_error("%s: Failed to connect splitter output port 1 to image encoder input", __func__);
-//         return -1;
-//     }
-//     PORT_USERDATA_IMAGE userdata;
+int take_picture(RASPIVID_STATE *state, unsigned char *preallocated_data, unsigned int length, unsigned int *lengthActual)
+{
+    int status;
+    VCOS_STATUS_T vcos_status;
+    MMAL_PORT_T *camera_video_port = state->camera_component->output[MMAL_CAMERA_VIDEO_PORT];
+    MMAL_PORT_T *splitter_image_port = state->splitter_component->output[1];
+    MMAL_PORT_T *encoder_input_port_image = state->encoder_component_image->input[0];
+    MMAL_PORT_T *encoder_output_port_image = state->encoder_component_image->output[0];
+    // Закомментировал и после этого получилось сделать два фото подряд
+    // if (state->encoder_connection_image == NULL)
+    // {
+    //     status = connect_ports(splitter_image_port, encoder_input_port_image, &state->encoder_connection_image);
+    //     if (status != MMAL_SUCCESS)
+    //     {
+    //         state->encoder_connection_image = NULL;
+    //         vcos_log_error("%s: Failed to connect splitter output port 1 to image encoder input", __func__);
+    //         return -1;
+    //     }
+    // }
+    PORT_USERDATA_IMAGE userdata;
+    userdata.pstate = state;
+    vcos_status = vcos_semaphore_create(&userdata.complete_semaphore, "Farvcam-sem", 0);
+    userdata.encoderPool = state->encoder_pool_image;
+    userdata.data = preallocated_data;
+    userdata.bufferPosition = 0;
+    userdata.offset = 0;
+    userdata.startingOffset = 0;
+    userdata.length = length;
+    userdata.lengthActual = 0;
 
-// }
+    encoder_output_port_image->userdata = (struct MMAL_PORT_USERDATA_T *)&userdata;
+    if (encoder_output_port_image->is_enabled)
+    {
+        printf("Could not enable encoder output port. Try waiting longer before attempting to take another picture\n");
+        return -1;
+    }
+    status = mmal_port_enable(encoder_output_port_image, encoder_buffer_callback_image);
+
+    int num = mmal_queue_length(state->encoder_pool_image->queue);
+    for (int q = 0; q < num; q++)
+    {
+        MMAL_BUFFER_HEADER_T *buffer = mmal_queue_get(state->encoder_pool_image->queue);
+
+        if (!buffer)
+            vcos_log_error("Unable to get a required buffer %d from pool queue", q);
+
+        if (mmal_port_send_buffer(encoder_output_port_image, buffer) != MMAL_SUCCESS)
+            vcos_log_error("Unable to send a buffer to encoder output port (%d)", q);
+    }
+    if (mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 1) != MMAL_SUCCESS)
+    {
+        vcos_log_error("Failed to start capture");
+        return -1;
+    }
+    vcos_semaphore_wait(&userdata.complete_semaphore);
+    vcos_semaphore_delete(&userdata.complete_semaphore);
+    // mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 0);
+    printf("Actual image size: %d\n", userdata.lengthActual);
+    *lengthActual = userdata.lengthActual;
+    if (!encoder_output_port_image->is_enabled)
+        return -1;
+    if (mmal_port_disable(encoder_output_port_image))
+    {
+        encoder_output_port_image->userdata = (const struct MMAL_PORT_USERDATA_T *){0};
+        userdata = (const PORT_USERDATA_IMAGE){0};
+    }
+    // для повторного использования функции видимо не нужно удалять соединение
+    // if (state->encoder_connection_image)
+    //     mmal_connection_destroy(state->encoder_connection_image);
+    return 0;
+}
+
+size_t getImageBufferSize(RASPIVID_STATE *state)
+{
+    //oversize the buffer so to fit BMP images
+    size_t buffer_size = state->common_settings.width * state->common_settings.height * 3 + 54;
+    return buffer_size;
+}
+
 /**
  * main
  */
@@ -2233,50 +2321,17 @@ int main(int argc, const char **argv)
     }
     printf("Camera, splitter and encoder components are created and connected!\n");
 
-    // Set up the image userdata
-    callback_data_image.file_handle = NULL;
-    callback_data_image.pstate = &state;
-    FILE *output_file = NULL;
-    vcos_status = vcos_semaphore_create(&callback_data_image.complete_semaphore, "Farvcam-sem", 0);
-    char jpeg_name[] = "test_image.jpeg";
-    // state.jpeg_filename = malloc(max_filename_length);
-    state.jpeg_filename = malloc(max_filename_length);
-    strncpy(state.jpeg_filename, jpeg_name, strlen(jpeg_name));
-    vcos_assert(state.jpeg_filename);
-    output_file = fopen(state.jpeg_filename, "wb");
-    callback_data_image.file_handle = output_file;
-    encoder_output_port_image->userdata = (struct MMAL_PORT_USERDATA_T *)&callback_data_image;
     vcos_sleep(state.timeout_image);
-    // status = mmal_port_enable(encoder_output_port_image, encoder_buffer_callback_image);
-    // if (callback_data_image.file_handle)
-    // {
-    //     int num = mmal_queue_length(state.encoder_pool_image->queue);
-    //     for (int q = 0; q < num; q++)
-    //     {
-    //         MMAL_BUFFER_HEADER_T *buffer = mmal_queue_get(state.encoder_pool_image->queue);
 
-    //         if (!buffer)
-    //             vcos_log_error("Unable to get a required buffer %d from pool queue", q);
-
-    //         if (mmal_port_send_buffer(encoder_output_port_image, buffer) != MMAL_SUCCESS)
-    //             vcos_log_error("Unable to send a buffer to encoder output port (%d)", q);
-    //     }
-    // }
-    // mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 1);
-    // vcos_semaphore_wait(&callback_data_image.complete_semaphore);
-    // mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 0);
-    // callback_data_image.file_handle = NULL;
-    // fclose(output_file);
-    // mmal_port_disable(encoder_output_port_image);
-    // vcos_semaphore_delete(&callback_data_image.complete_semaphore);
-    // callback_data_image = (const PORT_USERDATA_IMAGE){0};
-
-    // Set up our video userdata - this is passed through to the callback where we need the information.
+    // #################### здесь начинается запись видео
+    // state.common_settings.filename = malloc(max_filename_length);
+    // // Set up our video userdata - this is passed through to the callback where we need the information.
     // state.callback_data.pstate = &state;
     // state.callback_data.abort = 0;
     // state.callback_data.file_handle = NULL;
     // strncpy(state.common_settings.filename, "video1.h264", max_filename_length);
     // state.callback_data.file_handle = fopen(state.common_settings.filename, "wb");
+    // printf("Encoder connection status: %d \n", state.encoder_connection->is_enabled);
 
     // if (!state.callback_data.file_handle)
     // {
@@ -2310,48 +2365,61 @@ int main(int argc, const char **argv)
     // // Enable Capture parameter of camera video port for starting video capture
     // mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 1);
     // printf("Starting video capture\n");
-    state.common_settings.filename = malloc(max_filename_length);
-
-    start_recording(&state);
-    pause_and_test_abort(&state, 2500);
-    // Здесь начинается процедура захвата изображения с другого выхода сплиттера за счёт подключения второго энкодера
-    status = mmal_port_enable(encoder_output_port_image, encoder_buffer_callback_image);
-    if (callback_data_image.file_handle)
-    {
-        int num = mmal_queue_length(state.encoder_pool_image->queue);
-        for (int q = 0; q < num; q++)
-        {
-            MMAL_BUFFER_HEADER_T *buffer = mmal_queue_get(state.encoder_pool_image->queue);
-
-            if (!buffer)
-                vcos_log_error("Unable to get a required buffer %d from pool queue", q);
-
-            if (mmal_port_send_buffer(encoder_output_port_image, buffer) != MMAL_SUCCESS)
-                vcos_log_error("Unable to send a buffer to encoder output port (%d)", q);
-        }
-    }
-    // mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 1);
-    // ожидание конца захвата изображения
-    vcos_semaphore_wait(&callback_data_image.complete_semaphore);
-    // mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 0);
-    callback_data_image.file_handle = NULL;
-    fclose(output_file);
-    mmal_port_disable(encoder_output_port_image);
-    vcos_semaphore_delete(&callback_data_image.complete_semaphore);
-    callback_data_image = (const PORT_USERDATA_IMAGE){0};
-    /*конец процедуры захвата изображения. По хорошему здесь нужно выключать параметр MMAL_PARAMETER_CAPTURE,
-    чтобы точно завершить захват, но если это сделать, то прекратится запись видео (тогда нужно этот
-    параметр снова включать). Здесь выключение параметра произойдёт в функции stop_recording(&state)
-*/
-    pause_and_test_abort(&state, 2500);
-    stop_recording(&state);
+    // pause_and_test_abort(&state, 5000);
+    // // Disable Capture parameter of camera video port for stopping video capture
     // mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 0);
     // fprintf(stderr, "Finished capture\n");
-    // usleep(5000000);
+    // check_disable_port(encoder_output_port);
+    // if (state.encoder_connection)
+    //     mmal_connection_destroy(state.encoder_connection);
+    // fclose(state.callback_data.file_handle);
+    // state.callback_data = (const PORT_USERDATA){0};
+    // ########################### здесь заканчивается запись видео
+    FILE *output_file = NULL;
+    state.jpeg_filename = malloc(max_filename_length);
+    /* здесь получаем картинку меньшего объёма, но по качеству она не уступает
+    картинке после второго захвата, поскольку изначально изображение сохраняется
+    в буфере, размер которого взят с запасом. Приблизительный размер для разрешения
+    1920 на 1080 составляет 1 МБ */
+    unsigned int length = getImageBufferSize(&state);
+    unsigned char *data = malloc(length * sizeof(unsigned char));
+    unsigned int length_actual;
+    strncpy(state.jpeg_filename, "test_0.jpeg", max_filename_length);
+    output_file = fopen(state.jpeg_filename, "wb");
+    take_picture(&state, data, length, &length_actual);
+    fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
+    fclose(output_file);
+    output_file = NULL;
+    free(data);
 
-    mmal_status_to_int(status);
+    /* здесь получаем картинку с размером, равным буферу в который записываются
+    все данные. Буфер взят с большим запасом. Приблизительный размер для разрешения 
+    1920 на 1080 составляет 6 МБ */
+    strncpy(state.jpeg_filename, "test_1.jpeg", max_filename_length);
+    output_file = fopen(state.jpeg_filename, "wb");
+    data = malloc(length * sizeof(unsigned char));
+    take_picture(&state, data, length, &length_actual);
+    fwrite(data, 1, length, output_file);
+    fclose(output_file);
+    output_file = NULL;
+    free(data);
+
+    /* здесь два раза подряд записываем видео длительностью по 5 секунд */
+    state.common_settings.filename = malloc(max_filename_length);
+    strncpy(state.common_settings.filename, "video1.h264", max_filename_length);
+    start_recording(&state);
+    pause_and_test_abort(&state, 5000);
+    stop_recording(&state);
+
+    strncpy(state.common_settings.filename, "video2.h264", max_filename_length);
+    start_recording(&state);
+    pause_and_test_abort(&state, 5000);
+    stop_recording(&state);
+
     fprintf(stderr, "Closing down\n");
 
+    free(state.jpeg_filename);
+    free(state.common_settings.filename);
     // Disable all our ports that are not handled by connections
     check_disable_port(camera_still_port);
     check_disable_port(encoder_output_port);
@@ -2366,11 +2434,11 @@ int main(int argc, const char **argv)
         mmal_connection_destroy(state.encoder_connection_image);
     // Can now close our file. Note disabling ports may flush buffers which causes
     // problems if we have already closed the file!
-    if (state.callback_data.file_handle && state.callback_data.file_handle != stdout)
-        fclose(state.callback_data.file_handle);
+    // if (state.callback_data.file_handle && state.callback_data.file_handle != stdout)
+    //     fclose(state.callback_data.file_handle);
 
     // Clear callback userdata
-    state.callback_data = (const PORT_USERDATA){0};
+    // state.callback_data = (const PORT_USERDATA){0};
 
     /* Disable components */
     if (state.encoder_component)
