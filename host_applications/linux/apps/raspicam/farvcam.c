@@ -28,7 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 /**
- * \file RaspiVid.c
+ * \file farvcam.c
  * Программа для Raspberry Pi Zero для работы с терминалом CAN-WAY. Сырой вариант, в котором пока реализовано
  * получение фотографии и снятие видео. Видео и фотографии получаются одного разрешения,
  * поскольку используется сплиттер, подключенный к камере. Сплиттер имеет два выхода.
@@ -74,8 +74,12 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "RaspiGPS.h"
 
 #include <semaphore.h>
+#include <threads.h>
 
 #include <stdbool.h>
+#include <pthread.h>
+#include <termios.h>
+#include <fcntl.h>
 
 // Standard port setting for the camera component
 #define MMAL_CAMERA_PREVIEW_PORT 0
@@ -102,7 +106,7 @@ const int MAX_BITRATE_MJPEG = 25000000;   // 25Mbits/s
 const int MAX_BITRATE_LEVEL4 = 25000000;  // 25Mbits/s
 const int MAX_BITRATE_LEVEL42 = 62500000; // 62.5Mbits/s
 
-const int max_filename_length = 20;
+const int max_filename_length = 30;
 
 /// Interval at which we check for an failure abort during capture
 const int ABORT_INTERVAL = 100; // ms
@@ -352,6 +356,58 @@ static struct
 };
 
 static int wait_method_description_size = sizeof(wait_method_description) / sizeof(wait_method_description[0]);
+
+enum OV528_Command
+{
+    INIT = 0x01,
+    GET_PICTURE = 0x04,
+    SNAPSHOT = 0x05,
+    SET_PACKAGE_SIZE = 0x06,
+    SET_BAUD_RATE = 0x07,
+    RESET = 0x08,
+    POWER_DOWN = 0x09,
+    DATA = 0x0A,
+    SYNC = 0x0D,
+    ACK = 0x0E,
+    NAK = 0x0F
+};
+
+enum ColorSetting
+{
+    SET_2_BIT_GRAY_SCALE = 0x01,
+    SET_4_BIT_GRAY_SCALE = 0x02,
+    SET_8_BIT_GRAY_SCALE = 0x03,
+    SET_2_BIT_COLOR = 0x05,
+    SET_16_BIT_COLOR = 0x06,
+    SET_JPEG = 0x07
+};
+
+enum JPEG_Resolution
+{
+    RES_160x128 = 0x03,
+    RES_320x240 = 0x05,
+    RES_640x480 = 0x07
+};
+
+enum GetPicture
+{
+    GET_SNAPSHOT = 0x01,
+    GET_PREVIEW_PICTURE = 0x02,
+    GET_JPEG_PREVIEW_PICTURE = 0x03
+};
+
+enum Snapshot
+{
+    SNAPSHOT_COMPRESSED_PICTURE = 0x00,
+    SNAPSHOT_UNCOMPRESSED_PICTURE = 0x01
+};
+
+enum Data
+{
+    DATA_SNAPSHOT_PICTURE = 0x01,
+    DATA_PREVIEW_PICTURE = 0x02,
+    DATA_JPEG_PICTURE = 0x05
+};
 
 /**
  * Assign a default set of parameters to the state passed in
@@ -2214,6 +2270,100 @@ size_t getImageBufferSize(RASPIVID_STATE *state)
     return buffer_size;
 }
 
+int serial_setup(int fd, struct termios *old_serial, struct termios *new_serial)
+{
+    tcgetattr(fd, old_serial);
+    bzero(new_serial, sizeof(*new_serial));
+    /*
+      BAUDRATE: 115200 baud.
+      CRTSCTS : no output hardware flow control
+      CLOCAL  : do not change "owner" of the port
+      CS8     : 8n1 (8bit,no parity,1 stopbit)
+      CREAD   : enable receiving
+    */
+    cfsetispeed(new_serial, B115200);
+    cfsetospeed(new_serial, B115200);
+    new_serial->c_cflag |= (CLOCAL | CREAD);
+    new_serial->c_cflag &= ~PARENB;
+    new_serial->c_cflag &= ~CSTOPB;
+    new_serial->c_cflag &= ~CSIZE;
+    new_serial->c_cflag |= CS8;
+    new_serial->c_cflag &= ~CRTSCTS;
+    /* Do not map CR to NL and vice versa for input */
+    new_serial->c_iflag &= ~(ICRNL | INLCR);
+    new_serial->c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    new_serial->c_cc[VTIME] = 0.1; // межсимвольный таймер 0.1 sec
+    new_serial->c_cc[VMIN] = 6;    // блокирующее чтение до тех пор, пока не получим 6 символов
+    new_serial->c_oflag &= ~OPOST;
+    tcflush(fd, TCIFLUSH);
+    tcsetattr(fd, TCSANOW, new_serial);
+    return 0;
+}
+
+bool write_serial_command(int fd, uint8_t *args, uint8_t argn)
+{
+    int w = write(fd, args, argn);
+    //tcdrain(fd);
+    if (w < 0)
+        return false;
+    else
+        return true;
+}
+
+
+void *video_routine(void *state_arg)
+{
+    RASPIVID_STATE *state = (RASPIVID_STATE *)state_arg;
+    state->common_settings.filename = malloc(max_filename_length);
+    strncpy(state->common_settings.filename, "video1.h264", max_filename_length);
+    start_recording(state);
+    pause_and_test_abort(state, 60 * 1000);
+    stop_recording(state);
+    free(state->common_settings.filename);
+    return NULL;
+}
+
+void *photo_routine(void *state_arg)
+{
+    RASPIVID_STATE *state = (RASPIVID_STATE *)state_arg;
+
+    usleep(2 * 1000000);
+    FILE *output_file = NULL;
+    state->jpeg_filename = malloc(max_filename_length);
+    unsigned int length_oversized = getImageBufferSize(state);
+    uint8_t *data = malloc(length_oversized * sizeof(uint8_t));
+    unsigned int length_actual;
+
+    strncpy(state->jpeg_filename, "test_0.jpeg", max_filename_length);
+    output_file = fopen(state->jpeg_filename, "wb");
+    take_picture(state, data, length_oversized, &length_actual);
+    fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
+    fclose(output_file);
+    output_file = NULL;
+
+    usleep(2 * 1000000);
+    strncpy(state->jpeg_filename, "test_1.jpeg", max_filename_length);
+    output_file = fopen(state->jpeg_filename, "wb");
+    memset(data, 0, length_oversized);
+    take_picture(state, data, length_oversized, &length_actual);
+    fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
+    fclose(output_file);
+    output_file = NULL;
+
+    usleep(2 * 1000000);
+    strncpy(state->jpeg_filename, "test_2.jpeg", max_filename_length);
+    output_file = fopen(state->jpeg_filename, "wb");
+    memset(data, 0, length_oversized);
+    take_picture(state, data, length_oversized, &length_actual);
+    fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
+    fclose(output_file);
+    output_file = NULL;
+
+    free(data);
+    free(state->jpeg_filename);
+    return NULL;
+}
+
 /**
  * main
  */
@@ -2320,106 +2470,60 @@ int main(int argc, const char **argv)
         // goto error;
     }
     printf("Camera, splitter and encoder components are created and connected!\n");
-
+    // Ждём некоторое время для стабилизации камеры после соединений
     vcos_sleep(state.timeout_image);
 
-    // #################### здесь начинается запись видео
-    // state.common_settings.filename = malloc(max_filename_length);
-    // // Set up our video userdata - this is passed through to the callback where we need the information.
-    // state.callback_data.pstate = &state;
-    // state.callback_data.abort = 0;
-    // state.callback_data.file_handle = NULL;
-    // strncpy(state.common_settings.filename, "video1.h264", max_filename_length);
-    // state.callback_data.file_handle = fopen(state.common_settings.filename, "wb");
-    // printf("Encoder connection status: %d \n", state.encoder_connection->is_enabled);
 
-    // if (!state.callback_data.file_handle)
-    // {
-    //     // Notify user, carry on but discarding encoded output buffers
-    //     vcos_log_error("%s: Error opening output file: %s\nNo output file will be generated\n", __func__, state.common_settings.filename);
-    //     // return -1;
-    // }
-    // // Set up our userdata - this is passed through to the callback where we need the information.
-    // encoder_output_port->userdata = (struct MMAL_PORT_USERDATA_T *)&state.callback_data;
-    // // Enable the encoder output port and tell it its callback function
-    // status = mmal_port_enable(encoder_output_port, encoder_buffer_callback);
-    // // Only encode stuff if we have a filename and it opened
-    // // Note we use the copy in the callback, as the call back MIGHT change the file handle
+    // Настройка потоков для работы с видео и фотографиями
+    int rc1, rc2;
+    pthread_t video_thread, photo_thread;
+    // Создаём два потока - один для снятия и сохранения видео, второй - для получения фото и отправки по RS-232
+    if (rc1 = pthread_create(&video_thread, NULL, &video_routine, &state))
+    {
+        printf("Video thread creation failed: %d\n", rc1);
+    }
+    if (rc2 = pthread_create(&photo_thread, NULL, &photo_routine, &state))
+    {
+        printf("Photo thread creation failed: %d\n", rc2);
+    }
 
-    // // Send all the buffers to the encoder output port
-    // if (state.callback_data.file_handle)
-    // {
-    //     int num = mmal_queue_length(state.encoder_pool->queue);
-    //     int q;
-    //     for (q = 0; q < num; q++)
-    //     {
-    //         MMAL_BUFFER_HEADER_T *buffer = mmal_queue_get(state.encoder_pool->queue);
+    pthread_join(video_thread, NULL);
+    pthread_join(photo_thread, NULL);
 
-    //         if (!buffer)
-    //             vcos_log_error("Unable to get a required buffer %d from pool queue", q);
-
-    //         if (mmal_port_send_buffer(encoder_output_port, buffer) != MMAL_SUCCESS)
-    //             vcos_log_error("Unable to send a buffer to encoder output port (%d)", q);
-    //     }
-    // }
-    // // Enable Capture parameter of camera video port for starting video capture
-    // mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 1);
-    // printf("Starting video capture\n");
-    // pause_and_test_abort(&state, 5000);
-    // // Disable Capture parameter of camera video port for stopping video capture
-    // mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 0);
-    // fprintf(stderr, "Finished capture\n");
-    // check_disable_port(encoder_output_port);
-    // if (state.encoder_connection)
-    //     mmal_connection_destroy(state.encoder_connection);
-    // fclose(state.callback_data.file_handle);
-    // state.callback_data = (const PORT_USERDATA){0};
-    // ########################### здесь заканчивается запись видео
-    FILE *output_file = NULL;
-    state.jpeg_filename = malloc(max_filename_length);
+    // FILE *output_file = NULL;
+    // state.jpeg_filename = malloc(max_filename_length);
     /* здесь получаем картинку меньшего объёма, но по качеству она не уступает
     картинке после второго захвата, поскольку изначально изображение сохраняется
     в буфере, размер которого взят с запасом. Приблизительный размер для разрешения
     1920 на 1080 составляет 1 МБ */
-    unsigned int length = getImageBufferSize(&state);
-    unsigned char *data = malloc(length * sizeof(unsigned char));
-    unsigned int length_actual;
-    strncpy(state.jpeg_filename, "test_0.jpeg", max_filename_length);
-    output_file = fopen(state.jpeg_filename, "wb");
-    take_picture(&state, data, length, &length_actual);
-    fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
-    fclose(output_file);
-    output_file = NULL;
-    free(data);
+    // unsigned int length = getImageBufferSize(&state);
+    // unsigned char *data = malloc(length * sizeof(unsigned char));
+    // unsigned int length_actual;
+    // strncpy(state.jpeg_filename, "test_0.jpeg", max_filename_length);
+    // output_file = fopen(state.jpeg_filename, "wb");
+    // take_picture(&state, data, length, &length_actual);
+    // fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
+    // fclose(output_file);
+    // output_file = NULL;
+    // free(data);
 
     /* здесь получаем картинку с размером, равным буферу в который записываются
     все данные. Буфер взят с большим запасом. Приблизительный размер для разрешения 
     1920 на 1080 составляет 6 МБ */
-    strncpy(state.jpeg_filename, "test_1.jpeg", max_filename_length);
-    output_file = fopen(state.jpeg_filename, "wb");
-    data = malloc(length * sizeof(unsigned char));
-    take_picture(&state, data, length, &length_actual);
-    fwrite(data, 1, length, output_file);
-    fclose(output_file);
-    output_file = NULL;
-    free(data);
-
-    /* здесь два раза подряд записываем видео длительностью по 5 секунд */
-    state.common_settings.filename = malloc(max_filename_length);
-    strncpy(state.common_settings.filename, "video1.h264", max_filename_length);
-    start_recording(&state);
-    pause_and_test_abort(&state, 5000);
-    stop_recording(&state);
-
-    strncpy(state.common_settings.filename, "video2.h264", max_filename_length);
-    start_recording(&state);
-    pause_and_test_abort(&state, 5000);
-    stop_recording(&state);
+    // strncpy(state.jpeg_filename, "test_1.jpeg", max_filename_length);
+    // // output_file = fopen(state.jpeg_filename, "wb");
+    // data = malloc(length * sizeof(unsigned char));
+    // take_picture(&state, data, length, &length_actual);
+    // fwrite(data, 1, length, output_file);
+    // fclose(output_file);
+    // output_file = NULL;
+    // free(data);
 
     fprintf(stderr, "Closing down\n");
 
-    free(state.jpeg_filename);
-    free(state.common_settings.filename);
+    // free(state.jpeg_filename);
+    // free(state.common_settings.filename);
+
     // Disable all our ports that are not handled by connections
     check_disable_port(camera_still_port);
     check_disable_port(encoder_output_port);
