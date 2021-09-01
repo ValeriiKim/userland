@@ -47,6 +47,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <ctype.h>
 #include <memory.h>
 #include <sysexits.h>
+#include <math.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -357,7 +358,7 @@ static struct
 
 static int wait_method_description_size = sizeof(wait_method_description) / sizeof(wait_method_description[0]);
 
-enum OV528_Command
+typedef enum OV528_Command
 {
     INIT = 0x01,
     GET_PICTURE = 0x04,
@@ -429,8 +430,8 @@ static void default_status(RASPIVID_STATE *state)
 
     // Video capture default parameters
     state->timeout = 5000;               // replaced with 5000ms later if unset
-    state->common_settings.width = 1920; // Default to 1080p
-    state->common_settings.height = 1080;
+    state->common_settings.width = 640; // Default to 1080p
+    state->common_settings.height = 480;
     state->encoding = MMAL_ENCODING_H264;
     state->bitrate = 17000000; // This is a decent default bitrate for 1080p
     state->framerate = VIDEO_FRAME_RATE_NUM;
@@ -2292,8 +2293,8 @@ int serial_setup(int fd, struct termios *old_serial, struct termios *new_serial)
     /* Do not map CR to NL and vice versa for input */
     new_serial->c_iflag &= ~(ICRNL | INLCR);
     new_serial->c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
-    new_serial->c_cc[VTIME] = 0.1; // межсимвольный таймер 0.1 sec
-    new_serial->c_cc[VMIN] = 6;    // блокирующее чтение до тех пор, пока не получим 6 символов
+    new_serial->c_cc[VTIME] = 1; // межсимвольный таймер 0.1 sec
+    new_serial->c_cc[VMIN] = 6;  // блокирующее чтение до тех пор, пока не получим 6 символов
     new_serial->c_oflag &= ~OPOST;
     tcflush(fd, TCIFLUSH);
     tcsetattr(fd, TCSANOW, new_serial);
@@ -2310,57 +2311,230 @@ bool write_serial_command(int fd, uint8_t *args, uint8_t argn)
         return true;
 }
 
-
+/** Функция вызываемая потоком для записи и сохранения видео.
+ * @param state_arg указатель на структуру state
+ * @return NULL
+ * */
 void *video_routine(void *state_arg)
 {
     RASPIVID_STATE *state = (RASPIVID_STATE *)state_arg;
     state->common_settings.filename = malloc(max_filename_length);
     strncpy(state->common_settings.filename, "video1.h264", max_filename_length);
     start_recording(state);
-    pause_and_test_abort(state, 60 * 1000);
+    pause_and_test_abort(state, 1 * 5 * 1000);
     stop_recording(state);
     free(state->common_settings.filename);
     return NULL;
 }
 
+/** Функция вызываемая потоком для получения фото и его отправки в терминал CAN-WAY
+ * по протоколу OV528
+ * @param state_arg указатель на структуру state
+ * @return NULL
+ * */
 void *photo_routine(void *state_arg)
 {
     RASPIVID_STATE *state = (RASPIVID_STATE *)state_arg;
+    uint8_t commID, param1, param2, param3, param4;
+    uint8_t ACK_counter = 0x00;
+    // Буфер, в котором хранится принятое сообщение
+    uint8_t buffer[12];
+    /** Переменная, хранящая размер буфера изображения, 
+     * вычисляемый в callback-функции, т.е. это реальный размер изображения,
+     * не взятый с запасом
+     */
+    unsigned int data_length;
+    size_t package_size;
+    /** буфер для хранения данных изображения, получаемых динамически. В этот
+     * буфер будут копироваться данные после захвата изображения
+     */
+    uint8_t *image_buffer;
+    /** указатель на image_buffer для отправки данных буфера в последовательный порт
+     */
+    uint8_t *ptr;
+    // буфер для отправки пакета данных (пока что ограничен размером 512)
+    uint8_t package[512];
+    // ID текущего пакета, который необходимо отправить
+    uint32_t package_id = 0;
+    uint32_t package_max_id;
+    uint32_t verify_checksum = 0;
+    // переменная, запускающая цикл ожидания и обработки запроса
+    int running = 1;
 
-    usleep(2 * 1000000);
     FILE *output_file = NULL;
     state->jpeg_filename = malloc(max_filename_length);
-    unsigned int length_oversized = getImageBufferSize(state);
-    uint8_t *data = malloc(length_oversized * sizeof(uint8_t));
-    unsigned int length_actual;
 
-    strncpy(state->jpeg_filename, "test_0.jpeg", max_filename_length);
-    output_file = fopen(state->jpeg_filename, "wb");
-    take_picture(state, data, length_oversized, &length_actual);
-    fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
-    fclose(output_file);
-    output_file = NULL;
+    // Открытие и настройка последовательного порта
+    struct termios old_serial, new_serial;
+    int fd = open("/dev/serial0", O_RDWR | O_NOCTTY);
+    if (fd == -1)
+    {
+        fprintf(stderr, "Unable to open serial device\n");
+        return -1;
+    }
+    serial_setup(fd, &old_serial, &new_serial);
+    printf("Starting communication routine\n");
+    while (running)
+    {
+        int res = read(fd, buffer, 6);
+        printf("Number of received bytes: %d \n", res);
+        commID = buffer[1];
+        param1 = buffer[2];
+        param2 = buffer[3];
+        param3 = buffer[4];
+        param4 = buffer[5];
+        switch (commID)
+        {
+        case SYNC:
+        {
+            uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
+            printf("Received SYNC command \n");
+            write_serial_command(fd, args, 6);
+            break;
+        }
+        case INIT:
+        {
+            /**
+             * здесь должен быть switch с выбором разрешения фотографии, но это пока не реализовано
+             * также тут должен меняться формат кадра в соответствии с требованиями
+             * пока просто отправляем в ответ, что всё установлено (нет)
+             */
+            uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
+            write_serial_command(fd, args, 6);
+            break;
+        }
+        case SET_PACKAGE_SIZE:
+        {
+            printf("Receieved Set Package Command\n");
+            package_size = (param3 << 8U) | param2;
+            uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
+            write_serial_command(fd, args, 6);
+            printf("Package size is: %d\n", package_size);
+            break;
+        }
+        case SNAPSHOT:
+        {
+            printf("Received Snapshot command\n");
+            unsigned int length_oversized = getImageBufferSize(state);
+            image_buffer = malloc(length_oversized * sizeof(uint8_t));
+            // ptr = image_buffer;
+            // Выделяем память для изображения
+            uint8_t *data = malloc(length_oversized * sizeof(uint8_t));
+            // Делаем снимок
+            take_picture(state, data, length_oversized, &data_length);
+            package_max_id = floor(data_length / (package_size - 6));
+            memcpy(image_buffer, data, data_length);
+            ptr = image_buffer;
+            free(data);
+            uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
+            write_serial_command(fd, args, 6);
+            break;
+        }
+        case GET_PICTURE:
+        {
+            printf("Received Get picture command\n");
+            uint8_t args_1[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
+            write_serial_command(fd, args_1, 6);
+            param1 = data_length & 0x000000FFU;
+            param2 = (data_length & 0x0000FF00U) >> 8U;
+            param3 = (data_length & 0x00FF0000U) >> 16U;
+            uint8_t args_2[] = {0xAA, DATA, 0x01, param1, param2, param3};
+            write_serial_command(fd, args_2, 6);
+            break;
+        }
+        case ACK:
+        {
+            printf("Received ACK command\n");
+            if ((param3 == 0xF0) && (param4 == 0xF0))
+            {
+                printf("All Image data was sent!\n");
+            }
+            else
+            {
+                /** Отправляем целый пакет данных, если текущий ID требуемого
+                 * пакета меньше максимального
+                */
+                if (package_id < package_max_id)
+                {
+                    printf("Package ID: %d \n", package_id);
+                    package_id++;
+                    package[0] = param3;
+                    package[1] = param4;
+                    package[2] = (package_size - 6) & 0x000000FFU;
+                    package[3] = ((package_size - 6) & 0x0000FF00U) >> 8U;
+                    memcpy(package + 4, ptr, package_size - 6);
+                    for (int i = 0; i < package_size - 2; i++)
+                    {
+                        verify_checksum += package[i];
+                    }
+                    package[package_size - 2] = verify_checksum & 0x000000FFU;
+                    package[package_size - 1] = 0x00;
+                    int w = write(fd, package, package_size);
+                    printf("Bytes written: %d \n", w);
+                    ptr += package_size - 6;
+                    verify_checksum = 0;
+                }
+                /** Отправляем остаток данных в пакете меньшего размера - это пакет 
+                 * с максимальным идентификатором
+                */
+                else
+                {
+                    package_id++;
+                    package[0] = param3;
+                    package[1] = param4;
+                    package[2] = (data_length - package_max_id * (package_size - 6)) & 0x000000FFU;
+                    package[3] = ((data_length - package_max_id * (package_size - 6)) & 0x0000FF00U) >> 8U;
+                    memcpy(package + 4, ptr, data_length - package_max_id * (package_size - 6));
+                    for (int i = 0; i < 4 + data_length - package_max_id * (package_size - 6); i++)
+                    {
+                        verify_checksum += package[i];
+                    }
+                    package[4 + data_length - package_max_id * (package_size - 6)] = verify_checksum & 0x000000FFU;
+                    package[4 + data_length - package_max_id * (package_size - 6) + 1] = 0x00;
 
-    usleep(2 * 1000000);
-    strncpy(state->jpeg_filename, "test_1.jpeg", max_filename_length);
-    output_file = fopen(state->jpeg_filename, "wb");
-    memset(data, 0, length_oversized);
-    take_picture(state, data, length_oversized, &length_actual);
-    fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
-    fclose(output_file);
-    output_file = NULL;
+                    int w = write(fd, package, 6 + data_length - package_max_id * (package_size - 6));
+                    // tcdrain(fd);
+                    package_id = 0;
+                    verify_checksum = 0;
 
-    usleep(2 * 1000000);
-    strncpy(state->jpeg_filename, "test_2.jpeg", max_filename_length);
-    output_file = fopen(state->jpeg_filename, "wb");
-    memset(data, 0, length_oversized);
-    take_picture(state, data, length_oversized, &length_actual);
-    fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
-    fclose(output_file);
-    output_file = NULL;
+                    strncpy(state->jpeg_filename, "test_pic.jpeg", max_filename_length);
+                    output_file = fopen(state->jpeg_filename, "wb");
+                    fwrite(image_buffer, 1, data_length, output_file); // здесь записываем только реальное количество байт
+                    fclose(output_file);
+                    output_file = NULL;
 
-    free(data);
-    free(state->jpeg_filename);
+                    free(state->jpeg_filename);
+
+                    memset(image_buffer, 0, data_length);
+                    ptr = image_buffer;
+                }
+            }
+        }
+
+        break;
+        }
+        if (buffer[0] == 'Z')
+            running = 0;
+    }
+    free(image_buffer);
+    tcsetattr(fd, TCSANOW, &old_serial);
+    close(fd);
+    // usleep(2 * 1000000);
+    // FILE *output_file = NULL;
+    // state->jpeg_filename = malloc(max_filename_length);
+    // unsigned int length_oversized = getImageBufferSize(state);
+    // uint8_t *data = malloc(length_oversized * sizeof(uint8_t));
+    // unsigned int length_actual;
+
+    // strncpy(state->jpeg_filename, "test_0.jpeg", max_filename_length);
+    // output_file = fopen(state->jpeg_filename, "wb");
+    // take_picture(state, data, length_oversized, &length_actual);
+    // fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
+    // fclose(output_file);
+    // output_file = NULL;
+
+    // free(data);
+    // free(state->jpeg_filename);
     return NULL;
 }
 
@@ -2369,7 +2543,7 @@ void *photo_routine(void *state_arg)
  */
 int main(int argc, const char **argv)
 {
-    // Main data storage vessel
+    // Основная структура, хранящая практически все данные о камере и прочих компонентах
     RASPIVID_STATE state;
     PORT_USERDATA_IMAGE callback_data_image;
 
@@ -2472,7 +2646,6 @@ int main(int argc, const char **argv)
     printf("Camera, splitter and encoder components are created and connected!\n");
     // Ждём некоторое время для стабилизации камеры после соединений
     vcos_sleep(state.timeout_image);
-
 
     // Настройка потоков для работы с видео и фотографиями
     int rc1, rc2;
