@@ -225,11 +225,13 @@ struct RASPIVID_STATE_S
     MMAL_COMPONENT_T *splitter_component;      // Pointer to the splitter component
     MMAL_COMPONENT_T *encoder_component;       // Pointer to the encoder component
     MMAL_COMPONENT_T *encoder_component_image; // Pointer to the encoder component for image
+    MMAL_COMPONENT_T *resize_component;        // Pointer to the resize component
 
     MMAL_CONNECTION_T *preview_connection;       // Pointer to the connection from camera or splitter to preview
     MMAL_CONNECTION_T *splitter_connection;      // Pointer to the connection from camera to splitter
     MMAL_CONNECTION_T *encoder_connection;       // Pointer to the connection from camera to encoder
     MMAL_CONNECTION_T *encoder_connection_image; // Pointer to the connection from splitter to encoder
+    MMAL_CONNECTION_T *resizer_connection;       // Pointer to the connection from splitter to encoder
 
     MMAL_POOL_T *splitter_pool;       /// Pointer to the pool of buffers used by splitter output port 0
     MMAL_POOL_T *splitter_pool_image; // Pointer to the pool of buffers used by splitter output port 1
@@ -430,8 +432,8 @@ static void default_status(RASPIVID_STATE *state)
 
     // Video capture default parameters
     state->timeout = 5000;               // replaced with 5000ms later if unset
-    state->common_settings.width = 640; // Default to 1080p
-    state->common_settings.height = 480;
+    state->common_settings.width = 1920; // Default to 1080p
+    state->common_settings.height = 1080;
     state->encoding = MMAL_ENCODING_H264;
     state->bitrate = 17000000; // This is a decent default bitrate for 1080p
     state->framerate = VIDEO_FRAME_RATE_NUM;
@@ -1434,29 +1436,18 @@ static MMAL_STATUS_T create_splitter_component(RASPIVID_STATE *state)
     /* Splitter can do format conversions, configure format for its output port: */
     for (i = 0; i < splitter->output_num; i++)
     {
-        mmal_format_copy(splitter->output[i]->format, splitter->input[0]->format);
-
-        format = splitter->output[i]->format;
-
-        switch (state->raw_output_fmt)
+        if (i == 1)
         {
-        case RAW_OUTPUT_FMT_YUV:
-        case RAW_OUTPUT_FMT_GRAY: /* Grayscale image contains only luma (Y) component */
-            format->encoding = MMAL_ENCODING_I420;
-            format->encoding_variant = MMAL_ENCODING_I420;
-            break;
-        case RAW_OUTPUT_FMT_RGB:
-            if (mmal_util_rgb_order_fixed(state->camera_component->output[MMAL_CAMERA_CAPTURE_PORT]))
-                format->encoding = MMAL_ENCODING_RGB24;
-            else
-                format->encoding = MMAL_ENCODING_BGR24;
-            format->encoding_variant = 0; /* Irrelevant when not in opaque mode */
-            break;
-        default:
-            status = MMAL_EINVAL;
-            vcos_log_error("unknown raw output format");
-            goto error;
+            splitter->output[i]->buffer_num = 1;
         }
+        else
+        {
+            splitter->output[i]->buffer_num = VIDEO_OUTPUT_BUFFERS_NUM;
+        }
+        mmal_format_copy(splitter->output[i]->format, splitter->input[0]->format);
+        format = splitter->output[i]->format;
+        format->encoding = MMAL_ENCODING_I420;
+        format->encoding_variant = MMAL_ENCODING_I420;
 
         status = mmal_port_format_commit(splitter->output[i]);
 
@@ -1466,32 +1457,6 @@ static MMAL_STATUS_T create_splitter_component(RASPIVID_STATE *state)
             goto error;
         }
     }
-
-    /* Enable component */
-    status = mmal_component_enable(splitter);
-
-    if (status != MMAL_SUCCESS)
-    {
-        vcos_log_error("splitter component couldn't be enabled");
-        goto error;
-    }
-
-    /* Create pool of buffer headers for the output port to consume */
-    splitter_output = splitter->output[0];
-    pool = mmal_port_pool_create(splitter_output, splitter_output->buffer_num, splitter_output->buffer_size);
-    if (!pool)
-    {
-        vcos_log_error("Failed to create buffer header pool for splitter output port %s", splitter_output->name);
-    }
-    state->splitter_pool = pool;
-
-    splitter_output_image = splitter->output[1];
-    pool_image = mmal_port_pool_create(splitter_output_image, splitter_output_image->buffer_num, splitter_output_image->buffer_size);
-    if (!pool_image)
-    {
-        vcos_log_error("Failed to create buffer header pool for splitter output picture port %s", splitter_output_image->name);
-    }
-    state->splitter_pool_image = pool_image;
 
     state->splitter_component = splitter;
 
@@ -2016,6 +1981,76 @@ static void destroy_encoder_component_image(RASPIVID_STATE *state)
     }
 }
 
+MMAL_STATUS_T create_resizer_component(RASPIVID_STATE *state)
+{
+    MMAL_COMPONENT_T *resizer = 0;
+    MMAL_PORT_T *input_port = NULL;
+    MMAL_PORT_T *output_port = NULL;
+    MMAL_ES_FORMAT_T *format;
+    MMAL_STATUS_T status;
+
+    if (state->camera_component == NULL)
+    {
+        status = MMAL_ENOSYS;
+        vcos_log_error("Camera component must be created before splitter");
+        goto error;
+    }
+    status = mmal_component_create("vc.ril.isp", &resizer);
+    if (status != MMAL_SUCCESS)
+    {
+        printf("Failed to create resize component\n");
+        goto error;
+    }
+    // проверяем наличие портов у компонента
+    if (resizer->input_num < 1 || resizer->output_num < 1)
+    {
+        vcos_log_error("Resizer doesn't have enough ports");
+    }
+
+    mmal_format_copy(resizer->input[0]->format, state->splitter_component->output[1]->format);
+
+    resizer->input[0]->buffer_num = 1;
+    status = mmal_port_format_commit(resizer->input[0]);
+    if (status != MMAL_SUCCESS)
+    {
+        vcos_log_error("Unable to set format on resizer input port");
+        goto error;
+    }
+    resizer->output[0]->buffer_num = 1;
+    mmal_format_copy(resizer->output[0]->format, resizer->input[0]->format);
+    resizer->output[0]->format->es->video.width = 640;
+    resizer->output[0]->format->es->video.height = 480;
+    resizer->output[0]->format->es->video.crop.x = 0;
+    resizer->output[0]->format->es->video.crop.y = 0;
+    resizer->output[0]->format->es->video.crop.width = 640;
+    resizer->output[0]->format->es->video.crop.height = 480;
+    // resizer->output[0]->format->es->video.frame_rate.num = 0;
+    // resizer->output[0]->format->es->video.frame_rate.den = 1;
+
+    status = mmal_port_format_commit(resizer->output[0]);
+    if (status != MMAL_SUCCESS)
+    {
+        vcos_log_error("Unable to set format on resizer output port");
+        goto error;
+    }
+    state->resize_component = resizer;
+    return status;
+
+error:
+    if (resizer)
+        mmal_component_destroy(resizer);
+    return status;
+}
+
+void destroy_resize_component(RASPIVID_STATE *state)
+{
+    if (state->resize_component)
+    {
+        mmal_component_destroy(state->resize_component);
+        state->resize_component = NULL;
+    }
+}
+
 /**
  *  buffer header callback function for encoder
  *
@@ -2200,17 +2235,19 @@ int take_picture(RASPIVID_STATE *state, unsigned char *preallocated_data, unsign
     MMAL_PORT_T *splitter_image_port = state->splitter_component->output[1];
     MMAL_PORT_T *encoder_input_port_image = state->encoder_component_image->input[0];
     MMAL_PORT_T *encoder_output_port_image = state->encoder_component_image->output[0];
-    // Закомментировал и после этого получилось сделать два фото подряд
-    // if (state->encoder_connection_image == NULL)
-    // {
-    //     status = connect_ports(splitter_image_port, encoder_input_port_image, &state->encoder_connection_image);
-    //     if (status != MMAL_SUCCESS)
-    //     {
-    //         state->encoder_connection_image = NULL;
-    //         vcos_log_error("%s: Failed to connect splitter output port 1 to image encoder input", __func__);
-    //         return -1;
-    //     }
-    // }
+
+    // Восстанавливаем соединение энкодера, если оно было разорвано (после получения очередной фотографии)
+    if (!state->encoder_connection_image->is_enabled)
+    {
+        status = connect_ports(splitter_image_port, encoder_input_port_image, &state->encoder_connection_image);
+        if (status != MMAL_SUCCESS)
+        {
+            state->encoder_connection_image = NULL;
+            vcos_log_error("%s: Failed to connect splitter output port 1 to image encoder input", __func__);
+            return -1;
+        }
+        printf("Encoder connection for still image is ready\n");
+    }
     PORT_USERDATA_IMAGE userdata;
     userdata.pstate = state;
     vcos_status = vcos_semaphore_create(&userdata.complete_semaphore, "Farvcam-sem", 0);
@@ -2251,16 +2288,19 @@ int take_picture(RASPIVID_STATE *state, unsigned char *preallocated_data, unsign
     // mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 0);
     printf("Actual image size: %d\n", userdata.lengthActual);
     *lengthActual = userdata.lengthActual;
-    if (!encoder_output_port_image->is_enabled)
-        return -1;
-    if (mmal_port_disable(encoder_output_port_image))
+
+    // Выключаем порт и разрываем соединение, чтобы происходила очистка буферов перед следующим захватом
+    check_disable_port(encoder_output_port_image);
+    if (state->encoder_connection_image->is_enabled)
     {
-        encoder_output_port_image->userdata = (const struct MMAL_PORT_USERDATA_T *){0};
-        userdata = (const PORT_USERDATA_IMAGE){0};
+        status = mmal_connection_destroy(state->encoder_connection_image);
+        if (status == MMAL_SUCCESS)
+            printf("Encoder image connection was destroyed\n");
+        else
+            printf("Encoder image connection was not destroyed\n");
     }
-    // для повторного использования функции видимо не нужно удалять соединение
-    // if (state->encoder_connection_image)
-    //     mmal_connection_destroy(state->encoder_connection_image);
+    encoder_output_port_image->userdata = (const struct MMAL_PORT_USERDATA_T *){0};
+    userdata = (const PORT_USERDATA_IMAGE){0};
     return 0;
 }
 
@@ -2335,11 +2375,12 @@ void *video_routine(void *state_arg)
 void *photo_routine(void *state_arg)
 {
     RASPIVID_STATE *state = (RASPIVID_STATE *)state_arg;
+    MMAL_STATUS_T status = MMAL_SUCCESS;
     uint8_t commID, param1, param2, param3, param4;
     uint8_t ACK_counter = 0x00;
     // Буфер, в котором хранится принятое сообщение
     uint8_t buffer[12];
-    /** Переменная, хранящая размер буфера изображения, 
+    /** Переменная, хранящая размер буфера изображения,
      * вычисляемый в callback-функции, т.е. это реальный размер изображения,
      * не взятый с запасом
      */
@@ -2348,8 +2389,8 @@ void *photo_routine(void *state_arg)
     /** буфер для хранения данных изображения, получаемых динамически. В этот
      * буфер будут копироваться данные после захвата изображения
      */
-    uint8_t *image_buffer;
-    /** указатель на image_buffer для отправки данных буфера в последовательный порт
+    uint8_t *data;
+    /** указатель на data для отправки данных буфера в последовательный порт
      */
     uint8_t *ptr;
     // буфер для отправки пакета данных (пока что ограничен размером 512)
@@ -2358,6 +2399,8 @@ void *photo_routine(void *state_arg)
     uint32_t package_id = 0;
     uint32_t package_max_id;
     uint32_t verify_checksum = 0;
+    int im_width, im_height;
+    float w_to_h;
     // переменная, запускающая цикл ожидания и обработки запроса
     int running = 1;
 
@@ -2395,10 +2438,51 @@ void *photo_routine(void *state_arg)
         case INIT:
         {
             /**
-             * здесь должен быть switch с выбором разрешения фотографии, но это пока не реализовано
-             * также тут должен меняться формат кадра в соответствии с требованиями
-             * пока просто отправляем в ответ, что всё установлено (нет)
+             * изменение разрешения фотографии пока не работает
              */
+            switch (param4)
+            {
+            case RES_160x128:
+            {
+                // Это разрешение не поддерживается терминалом CAN-WAY
+                im_width = 160;
+                im_height = 128;
+                break;
+            }
+            case RES_320x240:
+            {
+                im_width = 320;
+                im_height = 240;
+                break;
+            }
+            case RES_640x480:
+            {
+                im_width = 640;
+                im_height = 480;
+                break;
+            }
+            }
+            printf("Received Initial command\n");
+            w_to_h = (float)im_width / (float)im_height;
+            unsigned int crop_width = ceil(state->common_settings.height * w_to_h);
+            MMAL_PARAMETER_CROP_T crop = {{MMAL_PARAMETER_CROP, sizeof(MMAL_PARAMETER_CROP_T)}, {0, 0, 0, 0}};
+            /** Терминал CAN-WAY отправляет запрос на получения фотографий, у которых отношение
+             * ширина/высота равно 5:4 или 4:3. При этом для разрешения видео 1920х1080 это отношение равно
+             * 16:9. Поэтому сначала видеокадр обрезается так, чтобы сохранить максимально возможное исходное
+             * разрешение, но при этом уменьшить ширину кадра для соответствия отношению 1.25 или 1.33. После
+             * этого разрешение обрезанного кадра можно уменьшить до заданного без искажения фото.
+             * */
+            crop.rect.x = state->common_settings.width / 2 - crop_width / 2;
+            crop.rect.y = 0;
+            crop.rect.width = crop_width;
+            crop.rect.height = state->common_settings.height;
+            // Пока что изменение разрешения плохо работает вместе с resizer
+            // status = mmal_port_parameter_set(state->resize_component->input[0], &crop.hdr);
+            // if (status != MMAL_SUCCESS)
+            // {
+            //     mmal_status_to_int(status);
+            //     return NULL;
+            // }
             uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
             write_serial_command(fd, args, 6);
             break;
@@ -2416,16 +2500,14 @@ void *photo_routine(void *state_arg)
         {
             printf("Received Snapshot command\n");
             unsigned int length_oversized = getImageBufferSize(state);
-            image_buffer = malloc(length_oversized * sizeof(uint8_t));
-            // ptr = image_buffer;
             // Выделяем память для изображения
-            uint8_t *data = malloc(length_oversized * sizeof(uint8_t));
+            data = malloc(length_oversized * sizeof(uint8_t));
             // Делаем снимок
             take_picture(state, data, length_oversized, &data_length);
+            // рассчитываем максимальный ID отправляемого пакета
             package_max_id = floor(data_length / (package_size - 6));
-            memcpy(image_buffer, data, data_length);
-            ptr = image_buffer;
-            free(data);
+            // ptr теперь указывает на первый элемент буфера data
+            ptr = data;
             uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
             write_serial_command(fd, args, 6);
             break;
@@ -2454,6 +2536,7 @@ void *photo_routine(void *state_arg)
                 /** Отправляем целый пакет данных, если текущий ID требуемого
                  * пакета меньше максимального
                 */
+                printf("Package maximum ID: %d \n", package_max_id);
                 if (package_id < package_max_id)
                 {
                     printf("Package ID: %d \n", package_id);
@@ -2474,11 +2557,12 @@ void *photo_routine(void *state_arg)
                     ptr += package_size - 6;
                     verify_checksum = 0;
                 }
-                /** Отправляем остаток данных в пакете меньшего размера - это пакет 
+                /** Отправляем остаток данных в пакете меньшего размера - это пакет
                  * с максимальным идентификатором
                 */
                 else
                 {
+                    printf("Package ID: %d \n", package_id);
                     package_id++;
                     package[0] = param3;
                     package[1] = param4;
@@ -2497,16 +2581,17 @@ void *photo_routine(void *state_arg)
                     package_id = 0;
                     verify_checksum = 0;
 
+                    // сохраняем фотографию на диске для отладки
                     strncpy(state->jpeg_filename, "test_pic.jpeg", max_filename_length);
                     output_file = fopen(state->jpeg_filename, "wb");
-                    fwrite(image_buffer, 1, data_length, output_file); // здесь записываем только реальное количество байт
+                    fwrite(data, 1, data_length, output_file); // здесь записываем только реальное количество байт
                     fclose(output_file);
                     output_file = NULL;
-
-                    free(state->jpeg_filename);
-
-                    memset(image_buffer, 0, data_length);
-                    ptr = image_buffer;
+                    // сбрасываем указатель
+                    ptr = NULL;
+                    // освобождаем память, динамически выделенную для хранения изображения
+                    memset(data, 0, data_length);
+                    free(data);
                 }
             }
         }
@@ -2516,25 +2601,27 @@ void *photo_routine(void *state_arg)
         if (buffer[0] == 'Z')
             running = 0;
     }
-    free(image_buffer);
     tcsetattr(fd, TCSANOW, &old_serial);
     close(fd);
-    // usleep(2 * 1000000);
+
     // FILE *output_file = NULL;
     // state->jpeg_filename = malloc(max_filename_length);
     // unsigned int length_oversized = getImageBufferSize(state);
     // uint8_t *data = malloc(length_oversized * sizeof(uint8_t));
     // unsigned int length_actual;
 
-    // strncpy(state->jpeg_filename, "test_0.jpeg", max_filename_length);
+    // printf("START\n");
+    // usleep(2 * 1000000);
+    // strncpy(state->jpeg_filename, "test_1.jpeg", max_filename_length);
     // output_file = fopen(state->jpeg_filename, "wb");
     // take_picture(state, data, length_oversized, &length_actual);
     // fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
     // fclose(output_file);
     // output_file = NULL;
+    // memset(data, 0, length_oversized);
 
-    // free(data);
-    // free(state->jpeg_filename);
+    // освобождаем память, динамически выделенную для хранения имени изображения
+    free(state->jpeg_filename);
     return NULL;
 }
 
@@ -2563,6 +2650,9 @@ int main(int argc, const char **argv)
     MMAL_PORT_T *splitter_output_port = NULL;
     MMAL_PORT_T *splitter_image_port = NULL;
     MMAL_PORT_T *splitter_preview_port = NULL;
+
+    MMAL_PORT_T *resizer_input_port = NULL;
+    MMAL_PORT_T *resizer_output_port = NULL;
 
     bcm_host_init();
     // Register our application with the logging system
@@ -2604,6 +2694,11 @@ int main(int argc, const char **argv)
         // exit_code = EX_SOFTWARE;
     }
 
+    if ((status = create_resizer_component(&state)) != MMAL_SUCCESS)
+    {
+        vcos_log_error("%s: Failed to create resize component for image capture", __func__);
+    }
+
     printf("Starting component connection stage\n");
     camera_video_port = state.camera_component->output[MMAL_CAMERA_VIDEO_PORT];
     camera_still_port = state.camera_component->output[MMAL_CAMERA_CAPTURE_PORT];
@@ -2613,6 +2708,9 @@ int main(int argc, const char **argv)
     splitter_input_port = state.splitter_component->input[0];
     splitter_output_port = state.splitter_component->output[SPLITTER_OUTPUT_PORT];
     splitter_image_port = state.splitter_component->output[1];
+
+    resizer_input_port = state.resize_component->input[0];
+    resizer_output_port = state.resize_component->output[0];
 
     encoder_input_port_image = state.encoder_component_image->input[0];
     encoder_output_port_image = state.encoder_component_image->output[0];
@@ -2643,6 +2741,24 @@ int main(int argc, const char **argv)
         vcos_log_error("%s: Failed to connect splitter output port 1 to image encoder input", __func__);
         // goto error;
     }
+    // printf("Connecting splitter output port 1 to resizer input port\n");
+    // status = connect_ports(splitter_image_port, resizer_input_port, &state.resizer_connection);
+    // if (status != MMAL_SUCCESS)
+    // {
+    //     state.resizer_connection = NULL;
+    //     vcos_log_error("%s: Failed to connect splitter output port 1 to resizer input port", __func__);
+    //     // goto error;
+    // }
+
+    // printf("Connecting resizer output port to encoder input port\n");
+    // status = connect_ports(resizer_output_port, encoder_input_port_image, &state.encoder_connection_image);
+    // if (status != MMAL_SUCCESS)
+    // {
+    //     state.resizer_connection = NULL;
+    //     vcos_log_error("%s: Failed to connect resizer output port to encoder input port", __func__);
+    //     // goto error;
+    // }
+
     printf("Camera, splitter and encoder components are created and connected!\n");
     // Ждём некоторое время для стабилизации камеры после соединений
     vcos_sleep(state.timeout_image);
@@ -2663,39 +2779,7 @@ int main(int argc, const char **argv)
     pthread_join(video_thread, NULL);
     pthread_join(photo_thread, NULL);
 
-    // FILE *output_file = NULL;
-    // state.jpeg_filename = malloc(max_filename_length);
-    /* здесь получаем картинку меньшего объёма, но по качеству она не уступает
-    картинке после второго захвата, поскольку изначально изображение сохраняется
-    в буфере, размер которого взят с запасом. Приблизительный размер для разрешения
-    1920 на 1080 составляет 1 МБ */
-    // unsigned int length = getImageBufferSize(&state);
-    // unsigned char *data = malloc(length * sizeof(unsigned char));
-    // unsigned int length_actual;
-    // strncpy(state.jpeg_filename, "test_0.jpeg", max_filename_length);
-    // output_file = fopen(state.jpeg_filename, "wb");
-    // take_picture(&state, data, length, &length_actual);
-    // fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
-    // fclose(output_file);
-    // output_file = NULL;
-    // free(data);
-
-    /* здесь получаем картинку с размером, равным буферу в который записываются
-    все данные. Буфер взят с большим запасом. Приблизительный размер для разрешения 
-    1920 на 1080 составляет 6 МБ */
-    // strncpy(state.jpeg_filename, "test_1.jpeg", max_filename_length);
-    // // output_file = fopen(state.jpeg_filename, "wb");
-    // data = malloc(length * sizeof(unsigned char));
-    // take_picture(&state, data, length, &length_actual);
-    // fwrite(data, 1, length, output_file);
-    // fclose(output_file);
-    // output_file = NULL;
-    // free(data);
-
     fprintf(stderr, "Closing down\n");
-
-    // free(state.jpeg_filename);
-    // free(state.common_settings.filename);
 
     // Disable all our ports that are not handled by connections
     check_disable_port(camera_still_port);
@@ -2705,17 +2789,12 @@ int main(int argc, const char **argv)
 
     if (state.encoder_connection)
         mmal_connection_destroy(state.encoder_connection);
+    if (state.resizer_connection)
+        mmal_connection_destroy(state.resizer_connection);
     if (state.splitter_connection)
         mmal_connection_destroy(state.splitter_connection);
     if (state.encoder_connection_image)
         mmal_connection_destroy(state.encoder_connection_image);
-    // Can now close our file. Note disabling ports may flush buffers which causes
-    // problems if we have already closed the file!
-    // if (state.callback_data.file_handle && state.callback_data.file_handle != stdout)
-    //     fclose(state.callback_data.file_handle);
-
-    // Clear callback userdata
-    // state.callback_data = (const PORT_USERDATA){0};
 
     /* Disable components */
     if (state.encoder_component)
@@ -2723,6 +2802,9 @@ int main(int argc, const char **argv)
 
     if (state.encoder_component_image)
         mmal_component_disable(state.encoder_component_image);
+
+    if (state.resize_component)
+        mmal_component_disable(state.resize_component);
 
     if (state.splitter_component)
         mmal_component_disable(state.splitter_component);
@@ -2733,6 +2815,7 @@ int main(int argc, const char **argv)
     destroy_encoder_component(&state);
     destroy_encoder_component_image(&state);
     raspipreview_destroy(&state.preview_parameters);
+    destroy_resize_component(&state);
     destroy_splitter_component(&state);
     destroy_camera_component(&state);
 
