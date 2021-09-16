@@ -46,6 +46,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "RaspiCamControl.h"
 #include "RaspiCommonSettings.h"
 
+#include "pigpio.h"
+
 #ifndef GIT_COMMIT_ID
 #define GIT_COMMIT_ID "Not found"
 #endif
@@ -206,6 +208,7 @@ void default_signal_handler(int signal_number)
    else
    {
       // Going to abort on all other signals
+      gpioTerminate();
       vcos_log_error("Aborting program\n");
       exit(130);
    }

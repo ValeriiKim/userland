@@ -55,19 +55,23 @@ else()
   set (EGL_SOURCES RaspiTexStub.c)
 endif()
 
+set(pigpio_DIR "/home/xbron/Projects/raspberrypi/rootfs/usr/local/lib/cmake/")
+find_package(pigpio CONFIG REQUIRED)
+
 add_executable(raspistill ${COMMON_SOURCES} RaspiStill.c  ${EGL_SOURCES} ${GL_SCENE_SOURCES} )
 add_executable(raspiyuv   ${COMMON_SOURCES} RaspiStillYUV.c)
 add_executable(raspivid   ${COMMON_SOURCES} RaspiVid.c)
 add_executable(raspividyuv  ${COMMON_SOURCES} RaspiVidYUV.c)
 add_executable(farvcam ${COMMON_SOURCES} farvcam.c)
 
+target_include_directories(farvcam PUBLIC ${pigpio_INCLUDE_DIR})
 
 set (MMAL_LIBS mmal_core mmal_util mmal_vc_client)
 target_link_libraries(raspistill ${MMAL_LIBS} vcos bcm_host ${EGL_LIBS} m dl)
 target_link_libraries(raspiyuv   ${MMAL_LIBS} vcos bcm_host m)
 target_link_libraries(raspivid   ${MMAL_LIBS} vcos bcm_host m)
 target_link_libraries(raspividyuv   ${MMAL_LIBS} vcos bcm_host m)
-target_link_libraries(farvcam ${MMAL_LIBS} vcos bcm_host m)
+target_link_libraries(farvcam ${MMAL_LIBS} vcos bcm_host m ${pigpio_LIBRARY})
 
 install(TARGETS raspistill raspiyuv raspivid raspividyuv farvcam RUNTIME DESTINATION bin)
 install(FILES raspistill.1 raspiyuv.1 raspivid.1 raspividyuv.1 DESTINATION man/man1)
