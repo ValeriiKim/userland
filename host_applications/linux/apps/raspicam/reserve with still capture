@@ -86,9 +86,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
-#define STB_IMAGE_RESIZE_IMPLEMENTATION
-#include "stb_image_resize.h"
-
 // Standard port setting for the camera component
 #define MMAL_CAMERA_PREVIEW_PORT 0
 #define MMAL_CAMERA_VIDEO_PORT 1
@@ -287,6 +284,8 @@ struct RASPIVID_STATE_S
     int datetime;                             /// Use DateTime instead of frame#
     int timestamp;                            /// Use timestamp instead of frame#
     int restart_interval;                     /// JPEG restart interval. 0 for none.
+    int photo_width;
+    int photo_height;
 };
 
 /// Structure to cross reference H264 profile strings against the MMAL parameter equivalent
@@ -470,14 +469,16 @@ static void default_status(RASPIVID_STATE *state)
     state->slices = 1;
 
     // Image capture default parameters
-    state->quality = 10;
+    state->quality = 85;
+    state->photo_width = 640;
+    state->photo_height = 480;
     state->wantRAW = 0;
     state->linkname = NULL;
     state->frameStart = 0;
     state->thumbnailConfig.enable = 1;
     state->thumbnailConfig.width = 64;
     state->thumbnailConfig.height = 48;
-    state->thumbnailConfig.quality = 15;
+    state->thumbnailConfig.quality = 35;
     state->demoMode = 0;
     state->demoInterval = 250; // ms
     state->camera_component = NULL;
@@ -841,7 +842,7 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
     if (pData)
     {
         int bytes_written = buffer->length;
-        // printf("Buffer length in callback: %d \n", bytes_written);
+        printf("Buffer length in callback: %d \n", bytes_written);
         int64_t current_time = get_microseconds64() / 1000;
 
         vcos_assert(pData->file_handle);
@@ -1133,6 +1134,7 @@ static MMAL_STATUS_T create_camera_component(RASPIVID_STATE *state)
     MMAL_ES_FORMAT_T *format;
     MMAL_PORT_T *preview_port = NULL, *video_port = NULL, *still_port = NULL;
     MMAL_STATUS_T status;
+    MMAL_POOL_T *pool;
 
     /* Create the component */
     status = mmal_component_create(MMAL_COMPONENT_DEFAULT_CAMERA, &camera);
@@ -1310,29 +1312,49 @@ static MMAL_STATUS_T create_camera_component(RASPIVID_STATE *state)
 
     format = still_port->format;
 
-    format->encoding = MMAL_ENCODING_OPAQUE;
-    format->encoding_variant = MMAL_ENCODING_I420;
+    if (state->camera_parameters.shutter_speed > 6000000)
+    {
+        MMAL_PARAMETER_FPS_RANGE_T fps_range = {{MMAL_PARAMETER_FPS_RANGE, sizeof(fps_range)},
+                                                {5, 1000},
+                                                {166, 1000}};
+        mmal_port_parameter_set(still_port, &fps_range.hdr);
+    }
+    else if (state->camera_parameters.shutter_speed > 1000000)
+    {
+        MMAL_PARAMETER_FPS_RANGE_T fps_range = {{MMAL_PARAMETER_FPS_RANGE, sizeof(fps_range)},
+                                                {167, 1000},
+                                                {999, 1000}};
+        mmal_port_parameter_set(still_port, &fps_range.hdr);
+    }
 
-    format->es->video.width = VCOS_ALIGN_UP(state->common_settings.width, 32);
-    format->es->video.height = VCOS_ALIGN_UP(state->common_settings.height, 16);
+    format->encoding = MMAL_ENCODING_RGB24;
+    format->encoding_variant = 0;
+    format->es->video.width = VCOS_ALIGN_UP(state->photo_width, 32);
+    format->es->video.height = VCOS_ALIGN_UP(state->photo_height, 16);
     format->es->video.crop.x = 0;
     format->es->video.crop.y = 0;
-    format->es->video.crop.width = state->common_settings.width;
-    format->es->video.crop.height = state->common_settings.height;
+    format->es->video.crop.width = state->photo_width;
+    format->es->video.crop.height = state->photo_height;
     format->es->video.frame_rate.num = 0;
     format->es->video.frame_rate.den = 1;
 
-    status = mmal_port_format_commit(still_port);
+    if (still_port->buffer_size < still_port->buffer_size_min)
+        still_port->buffer_size = still_port->buffer_size_min;
 
+    still_port->buffer_num = still_port->buffer_num_recommended;
+    status = mmal_port_parameter_set_boolean(still_port, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
+    if (status != MMAL_SUCCESS)
+    {
+        vcos_log_error("Failed to select zero copy");
+        goto error;
+    }
+
+    status = mmal_port_format_commit(still_port);
     if (status != MMAL_SUCCESS)
     {
         vcos_log_error("camera still format couldn't be set");
         goto error;
     }
-
-    /* Ensure there are enough buffers to avoid dropping frames */
-    if (still_port->buffer_num < VIDEO_OUTPUT_BUFFERS_NUM)
-        still_port->buffer_num = VIDEO_OUTPUT_BUFFERS_NUM;
 
     /* Enable component */
     status = mmal_component_enable(camera);
@@ -1342,10 +1364,18 @@ static MMAL_STATUS_T create_camera_component(RASPIVID_STATE *state)
         vcos_log_error("camera component couldn't be enabled");
         goto error;
     }
+    /* Create pool of buffer headers for the output port to consume */
+    pool = mmal_port_pool_create(still_port, still_port->buffer_num, still_port->buffer_size);
+
+    if (!pool)
+    {
+        vcos_log_error("Failed to create buffer header pool for camera still port %s", still_port->name);
+    }
 
     // Note: this sets lots of parameters that were not individually addressed before.
     raspicamcontrol_set_all_parameters(camera, &state->camera_parameters);
 
+    state->encoder_pool_image = pool;
     state->camera_component = camera;
 
     update_annotation_data(state);
@@ -1464,8 +1494,12 @@ static MMAL_STATUS_T create_splitter_component(RASPIVID_STATE *state)
             goto error;
         }
     }
+
     state->splitter_component = splitter;
-    fprintf(stderr, "Splitter component done\n");
+
+    if (state->common_settings.verbose)
+        fprintf(stderr, "Splitter component done\n");
+
     return status;
 
 error:
@@ -2075,8 +2109,6 @@ static void encoder_buffer_callback_image(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_
         unsigned int flags = buffer->flags;
         pData->lengthActual += buffer->length;
         mmal_buffer_header_mem_lock(buffer);
-        // printf("buffer->length: %d\n", buffer->length);
-        // printf("pData->offset: %d\n", pData->offset);
         for (unsigned int i = 0; i < buffer->length; i++, pData->bufferPosition++)
         {
             if (pData->offset >= pData->length)
@@ -2091,7 +2123,6 @@ static void encoder_buffer_callback_image(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_
             {
                 // if (pData->bufferPosition >= 54)
                 // {
-
                 pData->data[pData->offset] = buffer->data[i];
                 pData->offset++;
                 // }
@@ -2118,12 +2149,7 @@ static void encoder_buffer_callback_image(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_
 
         // // Now flag if we have completed
         if (buffer->flags & (MMAL_BUFFER_HEADER_FLAG_FRAME_END | MMAL_BUFFER_HEADER_FLAG_TRANSMISSION_FAILED))
-        {
-            printf("HERE\n");
-            // Перенёс функцию увеличения семафора сюда из конца функции
-            // после этого перестала возникать ошибка с недостаточным объёмом буфера
-            vcos_semaphore_post(&(pData->complete_semaphore));
-        }
+            complete = 1;
     }
     else
     {
@@ -2146,8 +2172,8 @@ static void encoder_buffer_callback_image(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_
         if (!new_buffer || status != MMAL_SUCCESS)
             vcos_log_error("Unable to return a buffer to the encoder port");
     }
-    // if (complete)
-    //     vcos_semaphore_post(&(pData->complete_semaphore));
+    if (complete)
+        vcos_semaphore_post(&(pData->complete_semaphore));
 }
 
 int start_recording(RASPIVID_STATE *state)
@@ -2155,12 +2181,11 @@ int start_recording(RASPIVID_STATE *state)
     int status;
     MMAL_PORT_T *camera_video_port = state->camera_component->output[MMAL_CAMERA_VIDEO_PORT];
     MMAL_PORT_T *encoder_output_port = state->encoder_component->output[0];
-    MMAL_PORT_T *splitter_output_port = state->splitter_component->output[SPLITTER_OUTPUT_PORT];
     MMAL_PORT_T *encoder_input_port = state->encoder_component->input[0];
     if (!state->encoder_connection->is_enabled)
     {
         printf("Enable the encoder connection!\n");
-        status = connect_ports(splitter_output_port, encoder_input_port, &state->encoder_connection);
+        status = connect_ports(camera_video_port, encoder_input_port, &state->encoder_connection);
         if (status != MMAL_SUCCESS)
         {
             state->encoder_connection = NULL;
@@ -2248,26 +2273,11 @@ int take_picture(RASPIVID_STATE *state, unsigned char *preallocated_data, unsign
 {
     int status;
     VCOS_STATUS_T vcos_status;
-    MMAL_PORT_T *camera_video_port = state->camera_component->output[MMAL_CAMERA_VIDEO_PORT];
-    MMAL_PORT_T *splitter_image_port = state->splitter_component->output[1];
-    MMAL_PORT_T *encoder_input_port_image = state->encoder_component_image->input[0];
-    MMAL_PORT_T *encoder_output_port_image = state->encoder_component_image->output[0];
+    MMAL_PORT_T *camera_still_port = state->camera_component->output[MMAL_CAMERA_CAPTURE_PORT];
 
-    // Восстанавливаем соединение энкодера, если оно было разорвано (после получения очередной фотографии)
-    if (!state->encoder_connection_image->is_enabled)
-    {
-        status = connect_ports(splitter_image_port, encoder_input_port_image, &state->encoder_connection_image);
-        if (status != MMAL_SUCCESS)
-        {
-            state->encoder_connection_image = NULL;
-            vcos_log_error("%s: Failed to connect splitter output port 1 to image encoder input", __func__);
-            return -1;
-        }
-        printf("Encoder connection for still image is ready\n");
-    }
     PORT_USERDATA_IMAGE userdata;
     userdata.pstate = state;
-    vcos_status = vcos_semaphore_create(&userdata.complete_semaphore, "Farvcam-sem", 0);
+    vcos_status = vcos_semaphore_create(&userdata.complete_semaphore, "Snapshot-sem", 0);
     userdata.encoderPool = state->encoder_pool_image;
     userdata.data = preallocated_data;
     userdata.bufferPosition = 0;
@@ -2276,13 +2286,17 @@ int take_picture(RASPIVID_STATE *state, unsigned char *preallocated_data, unsign
     userdata.length = length;
     userdata.lengthActual = 0;
 
-    encoder_output_port_image->userdata = (struct MMAL_PORT_USERDATA_T *)&userdata;
-    if (encoder_output_port_image->is_enabled)
+    camera_still_port->userdata = (struct MMAL_PORT_USERDATA_T *)&userdata;
+    if (camera_still_port->is_enabled)
     {
-        printf("Could not enable encoder output port. Try waiting longer before attempting to take another picture\n");
+        printf("Could not enable camera still port. Try waiting longer before attempting to take another picture\n");
         return -1;
     }
-    status = mmal_port_enable(encoder_output_port_image, encoder_buffer_callback_image);
+
+    status = mmal_port_enable(camera_still_port, encoder_buffer_callback_image);
+    // There is a possibility that shutter needs to be set each loop.
+    if (mmal_status_to_int(mmal_port_parameter_set_uint32(state->camera_component->control, MMAL_PARAMETER_SHUTTER_SPEED, state->camera_parameters.shutter_speed) != MMAL_SUCCESS))
+        vcos_log_error("Unable to set shutter speed");
 
     int num = mmal_queue_length(state->encoder_pool_image->queue);
     for (int q = 0; q < num; q++)
@@ -2292,41 +2306,39 @@ int take_picture(RASPIVID_STATE *state, unsigned char *preallocated_data, unsign
         if (!buffer)
             vcos_log_error("Unable to get a required buffer %d from pool queue", q);
 
-        if (mmal_port_send_buffer(encoder_output_port_image, buffer) != MMAL_SUCCESS)
-            vcos_log_error("Unable to send a buffer to encoder output port (%d)", q);
+        if (mmal_port_send_buffer(camera_still_port, buffer) != MMAL_SUCCESS)
+            vcos_log_error("Unable to send a buffer to camera still port (%d)", q);
     }
-    if (mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 1) != MMAL_SUCCESS)
+
+    if (mmal_port_parameter_set_boolean(camera_still_port, MMAL_PARAMETER_CAPTURE, 1) != MMAL_SUCCESS)
     {
         vcos_log_error("Failed to start capture");
         return -1;
     }
     vcos_semaphore_wait(&userdata.complete_semaphore);
     vcos_semaphore_delete(&userdata.complete_semaphore);
-    // mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 0);
     printf("Actual image size: %d\n", userdata.lengthActual);
     *lengthActual = userdata.lengthActual;
 
-    // Выключаем порт и разрываем соединение, чтобы происходила очистка буферов перед следующим захватом
-    check_disable_port(encoder_output_port_image);
-    if (state->encoder_connection_image->is_enabled)
+    if (mmal_port_parameter_set_boolean(camera_still_port, MMAL_PARAMETER_CAPTURE, 0) != MMAL_SUCCESS)
     {
-        status = mmal_connection_destroy(state->encoder_connection_image);
-        if (status == MMAL_SUCCESS)
-            printf("Encoder image connection was destroyed\n");
-        else
-            printf("Encoder image connection was not destroyed\n");
+        vcos_log_error("Failed to stop capture");
+        return -1;
     }
-    encoder_output_port_image->userdata = (const struct MMAL_PORT_USERDATA_T *){0};
+    // Выключаем порт и разрываем соединение, чтобы происходила очистка буферов перед следующим захватом
+    check_disable_port(camera_still_port);
+
+    camera_still_port->userdata = (const struct MMAL_PORT_USERDATA_T *){0};
     userdata = (const PORT_USERDATA_IMAGE){0};
+    // mmal_port_parameter_set_boolean(state->camera_component->output[1], MMAL_PARAMETER_CAPTURE, 1);
     return 0;
 }
 
 size_t getImageBufferSize(RASPIVID_STATE *state)
 {
     //oversize the buffer so to fit BMP images
-    //oversize the buffer so to fit BMP images
-    int width = VCOS_ALIGN_UP(1920, 32);
-    int height = VCOS_ALIGN_UP(1080, 16);
+    int width = VCOS_ALIGN_UP(state->photo_width, 32);
+    int height = VCOS_ALIGN_UP(state->photo_height, 16);
     size_t buffer_size = width * height * 3 + 54;
     return buffer_size;
 }
@@ -2371,34 +2383,6 @@ bool write_serial_command(int fd, uint8_t *args, uint8_t argn)
         return true;
 }
 
-/** Функция для обрезки кадра
- * @param input_image указатель на массив входного изображения
- * @param input_w ширина в пкс входного изображения
- * @param input_h высота в пкс входного изображения
- * @param output_image указатель на массив выходного обрезанного изображения, он должен
- * быть создан заранее
- * @param output_w ширина в пкс выходного обрезанного изображения
- * @param output_h высота в пкс выходного обрезанного изображения
- * @param cropX номер пикселя по оси X (горизонталь) изображения, с которого начинается обрезка
- * @param cropY номер пикселя по оси Y (вертикаль) изображения, с которого начинается обрезка
- * @return NULL
- * */
-void cropRGB(uint8_t *input_image, int input_w, int input_h,
-             uint8_t *output_image, int output_w, int output_h,
-             int cropX, int cropY)
-{
-    unsigned int row;
-    uint8_t *rowBuffer = malloc(3 * output_w * sizeof(uint8_t));
-    uint8_t *out_ptr = output_image;
-    for (row = cropY; row < cropY + output_h; ++row)
-    {
-        memcpy(out_ptr, input_image + 3 * (row * input_w + cropX), 3 * output_w);
-        if (row != cropY + output_h - 1)
-            out_ptr += 3 * output_w;
-    }
-    free(rowBuffer);
-}
-
 /** Функция вызываемая потоком для записи и сохранения видео.
  * @param state_arg указатель на структуру state
  * @return NULL
@@ -2413,28 +2397,33 @@ void *video_routine(void *state_arg)
     gpioSetPullUpDown(23, PI_PUD_UP);
     state->common_settings.filename = malloc(max_filename_length);
     // В терминале включённое состояние порта соответствует PI_OFF!
-    while (gpioRead(23) == PI_OFF)
-    {
-        // Ничего не делаем. Ждём пока пользователь не выключит выход
-        // Запись должна начинаться после перехода из состояния ВЫКЛ в состояние ВКЛ
-    }
-    while (1)
-    {
-        // пока выход снова не включен, ничего не делаем
-        if (gpioRead(23) == PI_OFF)
-        {
-            usleep(50*1000);
-            sprintf(video_name, "video_%d.h264", video_num);
-            strncpy(state->common_settings.filename, video_name, max_filename_length);
-            start_recording(state);
-            while (gpioRead(23) == PI_OFF)
-            {
-                // ждём пока выход не отключится
-            }
-            stop_recording(state);
-            video_num++;
-        }
-    }
+    sprintf(video_name, "video_%d.h264", video_num);
+    strncpy(state->common_settings.filename, video_name, max_filename_length);
+    start_recording(state);
+    pause_and_test_abort(state, 1 * 10 * 1000);
+    stop_recording(state);
+    video_num++;
+    // while (gpioRead(23) == PI_OFF)
+    // {
+    //     // Ничего не делаем. Ждём пока пользователь не выключит выход
+    //     // Запись должна начинаться после перехода из состояния ВЫКЛ в состояние ВКЛ
+    // }
+    // while (1)
+    // {
+    //     // пока выход снова не включен, ничего не делаем
+    //     if (gpioRead(23) == PI_OFF)
+    //     {
+    //         sprintf(video_name, "video_%d.h264", video_num);
+    //         strncpy(state->common_settings.filename, video_name, max_filename_length);
+    //         start_recording(state);
+    //         while (gpioRead(23) == PI_OFF)
+    //         {
+    //             // ждём пока выход не отключится
+    //         }
+    //         stop_recording(state);
+    //         video_num++;
+    //     }
+    // }
     free(state->common_settings.filename);
     return NULL;
 }
@@ -2467,261 +2456,275 @@ void *photo_routine(void *state_arg)
 {
     RASPIVID_STATE *state = (RASPIVID_STATE *)state_arg;
     MMAL_STATUS_T status = MMAL_SUCCESS;
-    uint8_t commID, param1, param2, param3, param4;
-    uint8_t ACK_counter = 0x00;
-    // Буфер, в котором хранится принятое сообщение
-    uint8_t buffer[12];
-    /** Переменная, хранящая размер буфера изображения,
-     * вычисляемый в callback-функции, т.е. это реальный размер изображения,
-     * не взятый с запасом
-     */
-    unsigned int data_length;
-    size_t package_size;
-    size_t reserve_size;
-    /** буфер для хранения данных изображения, получаемых динамически. В этот
-     * буфер будут копироваться данные после захвата изображения
-     */
-    uint8_t *data;
-    /** указатель на data для отправки данных буфера в последовательный порт
-     */
-    uint8_t *ptr;
-    // буфер для отправки пакета данных (пока что ограничен размером 512)
-    uint8_t package[512];
-    // резервный буфер для отправки данных в случае повторного запроса пакета данных
-    uint8_t reserve_package[512];
-    // ID текущего пакета, который необходимо отправить
-    uint32_t package_id = 0;
-    // ID предыдущего пакета, который уже отправлен
-    uint32_t package_id_prev = -1;
-    uint32_t package_max_id;
-    uint32_t verify_checksum = 0;
-    int im_width, im_height;
-    unsigned int crop_width, crop_height;
-    int cropX, cropY;
-    float w_to_h;
-    // переменная, запускающая цикл ожидания и обработки запроса
-    int running = 1;
-
-    FILE *output_file = NULL;
-    state->jpeg_filename = malloc(max_filename_length);
-    int photo_num = 0;
-
-    // Открытие и настройка последовательного порта
-    struct termios old_serial, new_serial;
-    int fd = open("/dev/serial0", O_RDWR | O_NOCTTY);
-    if (fd == -1)
-    {
-        fprintf(stderr, "Unable to open serial device\n");
-        return -1;
-    }
-    serial_setup(fd, &old_serial, &new_serial);
-    printf("Starting communication routine\n");
-    while (running)
-    {
-        int res = read(fd, buffer, 6);
-        // printf("Number of received bytes: %d \n", res);
-        commID = buffer[1];
-        param1 = buffer[2];
-        param2 = buffer[3];
-        param3 = buffer[4];
-        param4 = buffer[5];
-        switch (commID)
-        {
-        case SYNC:
-        {
-            uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
-            printf("Received SYNC command \n");
-            write_serial_command(fd, args, 6);
-            break;
-        }
-        case INIT:
-        {
-            /**
-             * изменение разрешения фотографии пока не работает
-             */
-            switch (param4)
-            {
-            case RES_160x128:
-            {
-                // Это разрешение не поддерживается терминалом CAN-WAY
-                im_width = 160;
-                im_height = 128;
-                break;
-            }
-            case RES_320x240:
-            {
-                im_width = 320;
-                im_height = 240;
-                break;
-            }
-            case RES_640x480:
-            {
-                im_width = 640;
-                im_height = 480;
-                break;
-            }
-            }
-            printf("Received Initial command\n");
-            // w_to_h = (float)im_width / (float)im_height;
-            // crop_width = ceil(state->common_settings.height * w_to_h);
-            // /** Терминал CAN-WAY отправляет запрос на получения фотографий, у которых отношение
-            //  * ширина/высота равно 5:4 или 4:3. При этом для разрешения видео 1920х1080 это отношение равно
-            //  * 16:9. Поэтому сначала видеокадр обрезается так, чтобы сохранить максимально возможное исходное
-            //  * разрешение, но при этом уменьшить ширину кадра для соответствия отношению 5:4 или 4:3. После
-            //  * этого разрешение обрезанного кадра можно уменьшить до заданного без искажения фото.
-            //  * */
-            // crop_height = state->common_settings.height;
-            // cropX = state->common_settings.width / 2 - crop_width / 2;
-            // cropY = 0;
-            uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
-            write_serial_command(fd, args, 6);
-            break;
-        }
-        case SET_PACKAGE_SIZE:
-        {
-            printf("Received Set Package Command\n");
-            package_size = (param3 << 8U) | param2;
-            uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
-            printf("Package size is: %d\n", package_size);
-            write_serial_command(fd, args, 6);
-            break;
-        }
-        case SNAPSHOT:
-        {
-            printf("Received Snapshot command\n");
-            uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
-            write_serial_command(fd, args, 6);
-            unsigned int length_oversized = getImageBufferSize(state);
-            // Выделяем память для изображения
-            data = malloc(length_oversized * sizeof(uint8_t));
-            // Делаем снимок
-            clock_t tic = clock();
-            take_picture(state, data, length_oversized, &data_length);
-            clock_t toc = clock();
-            printf("Elapsed: %f seconds\n", (double)(toc - tic) / CLOCKS_PER_SEC);
-            // рассчитываем максимальный ID отправляемого пакета
-            package_max_id = floor(data_length / (package_size - 6));
-            // ptr теперь указывает на первый элемент буфера data
-            ptr = data;
-            break;
-        }
-        case GET_PICTURE:
-        {
-            printf("Received Get picture command\n");
-            uint8_t args_1[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
-            write_serial_command(fd, args_1, 6);
-            param1 = data_length & 0x000000FFU;
-            param2 = (data_length & 0x0000FF00U) >> 8U;
-            param3 = (data_length & 0x00FF0000U) >> 16U;
-            uint8_t args_2[] = {0xAA, DATA, 0x01, param1, param2, param3};
-            write_serial_command(fd, args_2, 6);
-            break;
-        }
-        case ACK:
-        {
-            printf("Received ACK command\n");
-            if ((param3 == 0xF0) && (param4 == 0xF0))
-            {
-                printf("All Image data was sent!\n");
-            }
-            else
-            {
-                /** Отправляем целый пакет данных, если текущий ID требуемого
-                 * пакета меньше максимального
-                */
-                package_id = (param4 << 8U) | param3;
-                printf("Package maximum ID: %d, package ID: %d \n", package_max_id, package_id);
-                // printf("Package ID: %d \n", package_id);
-                if ((package_id < package_max_id) && (package_id != package_id_prev))
-                {
-                    package[0] = param3;
-                    package[1] = param4;
-                    package[2] = (package_size - 6) & 0x000000FFU;
-                    package[3] = ((package_size - 6) & 0x0000FF00U) >> 8U;
-                    memcpy(package + 4, ptr, package_size - 6);
-                    for (int i = 0; i < package_size - 2; i++)
-                    {
-                        verify_checksum += package[i];
-                    }
-                    package[package_size - 2] = verify_checksum & 0x000000FFU;
-                    package[package_size - 1] = 0x00;
-                    int w = write(fd, package, package_size);
-                    // printf("Bytes written: %d \n", w);
-                    ptr += package_size - 6;
-                    verify_checksum = 0;
-                    package_id_prev = package_id;
-                    reserve_size = package_size;
-                    memcpy(reserve_package, package, package_size);
-                }
-                /** Отправляем остаток данных в пакете меньшего размера - это пакет
-                 * с максимальным идентификатором
-                */
-                else if (package_id != package_id_prev)
-                {
-                    package[0] = param3;
-                    package[1] = param4;
-                    package[2] = (data_length - package_max_id * (package_size - 6)) & 0x000000FFU;
-                    package[3] = ((data_length - package_max_id * (package_size - 6)) & 0x0000FF00U) >> 8U;
-                    memcpy(package + 4, ptr, data_length - package_max_id * (package_size - 6));
-                    for (int i = 0; i < 4 + data_length - package_max_id * (package_size - 6); i++)
-                    {
-                        verify_checksum += package[i];
-                    }
-                    package[4 + data_length - package_max_id * (package_size - 6)] = verify_checksum & 0x000000FFU;
-                    package[4 + data_length - package_max_id * (package_size - 6) + 1] = 0x00;
-
-                    int w = write(fd, package, 6 + data_length - package_max_id * (package_size - 6));
-                    // tcdrain(fd);
-                    verify_checksum = 0;
-                    package_id_prev = package_id;
-                    reserve_size = package_size;
-                    memcpy(reserve_package, package, 6 + data_length - package_max_id * (package_size - 6));
-
-                    // сохраняем фотографию на диске для отладки
-                    sprintf(state->jpeg_filename, "photo_%d.jpeg", photo_num);
-                    // strncpy(state->jpeg_filename, "test_pic.jpeg", max_filename_length);
-                    output_file = fopen(state->jpeg_filename, "wb");
-                    fwrite(data, 1, data_length, output_file); // здесь записываем только реальное количество байт
-                    fclose(output_file);
-                    output_file = NULL;
-                    photo_num++;
-                    // сбрасываем указатель
-                    ptr = NULL;
-                    // освобождаем память, динамически выделенную для хранения изображения
-                    free(data);
-                }
-                else
-                {
-                    int w = write(fd, reserve_package, reserve_size);
-                }
-            }
-        }
-
-        break;
-        }
-        if (buffer[0] == 'Z')
-            running = 0;
-    }
-    tcsetattr(fd, TCSANOW, &old_serial);
-    close(fd);
+    // uint8_t commID, param1, param2, param3, param4;
+    // uint8_t ACK_counter = 0x00;
+    // // Буфер, в котором хранится принятое сообщение
+    // uint8_t buffer[12];
+    // /** Переменная, хранящая размер буфера изображения,
+    //  * вычисляемый в callback-функции, т.е. это реальный размер изображения,
+    //  * не взятый с запасом
+    //  */
+    // unsigned int data_length;
+    // size_t package_size;
+    // /** буфер для хранения данных изображения, получаемых динамически. В этот
+    //  * буфер будут копироваться данные после захвата изображения
+    //  */
+    // uint8_t *data;
+    // /** указатель на data для отправки данных буфера в последовательный порт
+    //  */
+    // uint8_t *ptr;
+    // // буфер для отправки пакета данных (пока что ограничен размером 512)
+    // uint8_t package[512];
+    // // ID текущего пакета, который необходимо отправить
+    // uint32_t package_id = 0, package_id_prev = 0;
+    // uint32_t package_max_id;
+    // uint32_t verify_checksum = 0;
+    // int im_width, im_height;
+    // float w_to_h;
+    // // переменная, запускающая цикл ожидания и обработки запроса
+    // int running = 1;
 
     // FILE *output_file = NULL;
     // state->jpeg_filename = malloc(max_filename_length);
-    // unsigned int length_oversized = getImageBufferSize(state);
-    // uint8_t *data = malloc(length_oversized * sizeof(uint8_t));
-    // unsigned int length_actual;
 
-    // printf("START\n");
-    // usleep(2 * 1000000);
-    // strncpy(state->jpeg_filename, "test_1.jpeg", max_filename_length);
+    // // Открытие и настройка последовательного порта
+    // struct termios old_serial, new_serial;
+    // int fd = open("/dev/serial0", O_RDWR | O_NOCTTY);
+    // if (fd == -1)
+    // {
+    //     fprintf(stderr, "Unable to open serial device\n");
+    //     return -1;
+    // }
+    // serial_setup(fd, &old_serial, &new_serial);
+    // printf("Starting communication routine\n");
+    // while (running)
+    // {
+    //     int res = read(fd, buffer, 6);
+    //     printf("Number of received bytes: %d \n", res);
+    //     commID = buffer[1];
+    //     param1 = buffer[2];
+    //     param2 = buffer[3];
+    //     param3 = buffer[4];
+    //     param4 = buffer[5];
+    //     switch (commID)
+    //     {
+    //     case SYNC:
+    //     {
+    //         uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
+    //         printf("Received SYNC command \n");
+    //         write_serial_command(fd, args, 6);
+    //         break;
+    //     }
+    //     case INIT:
+    //     {
+    //         /**
+    //          * изменение разрешения фотографии пока не работает
+    //          */
+    //         switch (param4)
+    //         {
+    //         case RES_160x128:
+    //         {
+    //             // Это разрешение не поддерживается терминалом CAN-WAY
+    //             im_width = 160;
+    //             im_height = 128;
+    //             break;
+    //         }
+    //         case RES_320x240:
+    //         {
+    //             im_width = 320;
+    //             im_height = 240;
+    //             break;
+    //         }
+    //         case RES_640x480:
+    //         {
+    //             im_width = 640;
+    //             im_height = 480;
+    //             break;
+    //         }
+    //         }
+    //         printf("Received Initial command\n");
+    //         w_to_h = (float)im_width / (float)im_height;
+    //         unsigned int crop_width = ceil(state->common_settings.height * w_to_h);
+    //         MMAL_PARAMETER_CROP_T crop = {{MMAL_PARAMETER_CROP, sizeof(MMAL_PARAMETER_CROP_T)}, {0, 0, 0, 0}};
+    //         /** Терминал CAN-WAY отправляет запрос на получения фотографий, у которых отношение
+    //          * ширина/высота равно 5:4 или 4:3. При этом для разрешения видео 1920х1080 это отношение равно
+    //          * 16:9. Поэтому сначала видеокадр обрезается так, чтобы сохранить максимально возможное исходное
+    //          * разрешение, но при этом уменьшить ширину кадра для соответствия отношению 1.25 или 1.33. После
+    //          * этого разрешение обрезанного кадра можно уменьшить до заданного без искажения фото.
+    //          * */
+    //         crop.rect.x = state->common_settings.width / 2 - crop_width / 2;
+    //         crop.rect.y = 0;
+    //         crop.rect.width = crop_width;
+    //         crop.rect.height = state->common_settings.height;
+    //         // Пока что изменение разрешения плохо работает вместе с resizer
+    //         // status = mmal_port_parameter_set(state->resize_component->input[0], &crop.hdr);
+    //         // if (status != MMAL_SUCCESS)
+    //         // {
+    //         //     mmal_status_to_int(status);
+    //         //     return NULL;
+    //         // }
+    //         uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
+    //         write_serial_command(fd, args, 6);
+    //         break;
+    //     }
+    //     case SET_PACKAGE_SIZE:
+    //     {
+    //         printf("Receieved Set Package Command\n");
+    //         package_size = (param3 << 8U) | param2;
+    //         uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
+    //         write_serial_command(fd, args, 6);
+    //         printf("Package size is: %d\n", package_size);
+    //         break;
+    //     }
+    //     case SNAPSHOT:
+    //     {
+    //         printf("Received Snapshot command\n");
+    //         // unsigned int length_oversized = getImageBufferSize(state);
+    //         // // Выделяем память для изображения
+    //         // data = malloc(length_oversized * sizeof(uint8_t));
+    //         // // Делаем снимок
+    //         // take_picture(state, data, length_oversized, &data_length);
+    //         // // рассчитываем максимальный ID отправляемого пакета
+    //         // package_max_id = floor(data_length / (package_size - 6));
+    //         // // ptr теперь указывает на первый элемент буфера data
+    //         // ptr = data;
+    //         uint8_t args[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
+    //         write_serial_command(fd, args, 6);
+    //         unsigned int length_oversized = getImageBufferSize(state);
+    //         // Выделяем память для изображения
+    //         data = malloc(length_oversized * sizeof(uint8_t));
+    //         // Делаем снимок
+    //         take_picture(state, data, length_oversized, &data_length);
+    //         // рассчитываем максимальный ID отправляемого пакета
+    //         package_max_id = floor(data_length / (package_size - 6));
+    //         // ptr теперь указывает на первый элемент буфера data
+    //         ptr = data;
+    //         break;
+    //     }
+    //     case GET_PICTURE:
+    //     {
+    //         printf("Received Get picture command\n");
+    //         uint8_t args_1[] = {0xAA, ACK, commID, ACK_counter, 0x00, 0x00};
+    //         write_serial_command(fd, args_1, 6);
+    //         param1 = data_length & 0x000000FFU;
+    //         param2 = (data_length & 0x0000FF00U) >> 8U;
+    //         param3 = (data_length & 0x00FF0000U) >> 16U;
+    //         uint8_t args_2[] = {0xAA, DATA, 0x01, param1, param2, param3};
+    //         write_serial_command(fd, args_2, 6);
+    //         break;
+    //     }
+    //     case ACK:
+    //     {
+    //         printf("Received ACK command\n");
+    //         if ((param3 == 0xF0) && (param4 == 0xF0))
+    //         {
+    //             printf("All Image data was sent!\n");
+    //         }
+    //         else
+    //         {
+    //             /** Отправляем целый пакет данных, если текущий ID требуемого
+    //              * пакета меньше максимального
+    //             */
+    //             printf("Package maximum ID: %d \n", package_max_id);
+    //             package_id = (param4 << 8U) | param3;
+    //             printf("Package ID: %d \n", package_id);
+    //             if ((package_id < package_max_id) && (package_id != package_id_prev))
+    //             {
+    //                 package[0] = param3;
+    //                 package[1] = param4;
+    //                 package[2] = (package_size - 6) & 0x000000FFU;
+    //                 package[3] = ((package_size - 6) & 0x0000FF00U) >> 8U;
+    //                 memcpy(package + 4, ptr, package_size - 6);
+    //                 for (int i = 0; i < package_size - 2; i++)
+    //                 {
+    //                     verify_checksum += package[i];
+    //                 }
+    //                 package[package_size - 2] = verify_checksum & 0x000000FFU;
+    //                 package[package_size - 1] = 0x00;
+    //                 int w = write(fd, package, package_size);
+    //                 printf("Bytes written: %d \n", w);
+    //                 ptr += package_size - 6;
+    //                 verify_checksum = 0;
+    //                 package_id_prev = package_id;
+    //             }
+    //             /** Отправляем остаток данных в пакете меньшего размера - это пакет
+    //              * с максимальным идентификатором
+    //             */
+    //             else if (package_id != package_id_prev)
+    //             {
+    //                 package[0] = param3;
+    //                 package[1] = param4;
+    //                 package[2] = (data_length - package_max_id * (package_size - 6)) & 0x000000FFU;
+    //                 package[3] = ((data_length - package_max_id * (package_size - 6)) & 0x0000FF00U) >> 8U;
+    //                 memcpy(package + 4, ptr, data_length - package_max_id * (package_size - 6));
+    //                 for (int i = 0; i < 4 + data_length - package_max_id * (package_size - 6); i++)
+    //                 {
+    //                     verify_checksum += package[i];
+    //                 }
+    //                 package[4 + data_length - package_max_id * (package_size - 6)] = verify_checksum & 0x000000FFU;
+    //                 package[4 + data_length - package_max_id * (package_size - 6) + 1] = 0x00;
+
+    //                 int w = write(fd, package, 6 + data_length - package_max_id * (package_size - 6));
+    //                 // tcdrain(fd);
+    //                 package_id = 0;
+    //                 verify_checksum = 0;
+    //                 package_id_prev = package_id;
+
+    //                 // сохраняем фотографию на диске для отладки
+    //                 strncpy(state->jpeg_filename, "test_pic.jpeg", max_filename_length);
+    //                 output_file = fopen(state->jpeg_filename, "wb");
+    //                 fwrite(data, 1, data_length, output_file); // здесь записываем только реальное количество байт
+    //                 fclose(output_file);
+    //                 output_file = NULL;
+    //                 // сбрасываем указатель
+    //                 ptr = NULL;
+    //                 // освобождаем память, динамически выделенную для хранения изображения
+    //                 memset(data, 0, data_length);
+    //                 free(data);
+    //             }
+    //         }
+    //     }
+
+    //     break;
+    //     }
+    //     if (buffer[0] == 'Z')
+    //         running = 0;
+    // }
+    // tcsetattr(fd, TCSANOW, &old_serial);
+    // close(fd);
+
+    FILE *output_file = NULL;
+    state->jpeg_filename = malloc(max_filename_length);
+    unsigned int length_oversized = getImageBufferSize(state);
+    uint8_t *data = malloc(length_oversized * sizeof(uint8_t));
+    unsigned int length_actual;
+    uint8_t *buffer = malloc(length_oversized * sizeof(uint8_t));
+
+    printf("START\n");
+    usleep(2 * 1000000);
+    // strncpy(state->jpeg_filename, "test_1.txt", max_filename_length);
     // output_file = fopen(state->jpeg_filename, "wb");
-    // take_picture(state, data, length_oversized, &length_actual);
+    mmal_port_parameter_set_boolean(state->camera_component->output[1], MMAL_PARAMETER_CAPTURE, 0);
+    take_picture(state, data, length_oversized, &length_actual);
+    mmal_port_parameter_set_boolean(state->camera_component->output[1], MMAL_PARAMETER_CAPTURE, 1);
     // fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
     // fclose(output_file);
     // output_file = NULL;
-    // memset(data, 0, length_oversized);
-    // free(data);
+
+    custom_stbi_mem_context ct;
+    ct.last_pos = 0;
+    ct.context = (void *)buffer;
+    int result = stbi_write_jpg_to_func(custom_stbi_write_mem, &ct, 640, 480, 3, data, 90);
+    strncpy(state->jpeg_filename, "test_1.jpeg", max_filename_length);
+    output_file = fopen(state->jpeg_filename, "wb");
+    fwrite(buffer, 1, length_actual, output_file); // здесь записываем только реальное количество байт
+    fclose(output_file);
+    output_file = NULL;
+    stbi_write_jpg("t1.jpeg", 640, 480, 3, data, 90);
+    // освобождаем память, динамически выделенную для хранения имени изображения
     free(state->jpeg_filename);
+    free(data);
+    free(buffer);
     return NULL;
 }
 
@@ -2733,6 +2736,7 @@ int main(int argc, const char **argv)
     // Основная структура, хранящая практически все данные о камере и прочих компонентах
     RASPIVID_STATE state;
     PORT_USERDATA_IMAGE callback_data_image;
+
     // int exit_code = EX_OK;
     MMAL_STATUS_T status = MMAL_SUCCESS;
     MMAL_PORT_T *camera_preview_port = NULL;
@@ -2780,18 +2784,11 @@ int main(int argc, const char **argv)
         destroy_camera_component(&state);
         // exit_code = EX_SOFTWARE;
     }
-    if ((status = create_splitter_component(&state)) != MMAL_SUCCESS)
-    {
-        vcos_log_error("%s: Failed to create splitter component", __func__);
-        raspipreview_destroy(&state.preview_parameters);
-        destroy_camera_component(&state);
-        destroy_encoder_component(&state);
-    }
-    if ((status = create_encoder_component_image(&state)) != MMAL_SUCCESS)
-    {
-        vcos_log_error("%s: Failed to create encoder component for image capture", __func__);
-        // exit_code = EX_SOFTWARE;
-    }
+    // if ((status = create_encoder_component_image(&state)) != MMAL_SUCCESS)
+    // {
+    //     vcos_log_error("%s: Failed to create encoder component for image capture", __func__);
+    //     // exit_code = EX_SOFTWARE;
+    // }
 
     printf("Starting component connection stage\n");
     camera_video_port = state.camera_component->output[MMAL_CAMERA_VIDEO_PORT];
@@ -2799,43 +2796,29 @@ int main(int argc, const char **argv)
     encoder_input_port = state.encoder_component->input[0];
     encoder_output_port = state.encoder_component->output[0];
 
-    splitter_input_port = state.splitter_component->input[0];
-    splitter_output_port = state.splitter_component->output[SPLITTER_OUTPUT_PORT];
-    splitter_image_port = state.splitter_component->output[1];
-
-    encoder_input_port_image = state.encoder_component_image->input[0];
-    encoder_output_port_image = state.encoder_component_image->output[0];
+    // encoder_input_port_image = state.encoder_component_image->input[0];
+    // encoder_output_port_image = state.encoder_component_image->output[0];
 
     VCOS_STATUS_T vcos_status;
 
-    printf("Connecting camera video port to splitter input port\n");
-    status = connect_ports(camera_video_port, splitter_input_port, &state.splitter_connection);
+    printf("Connecting camera video port to video encoder input port\n");
+    status = connect_ports(camera_video_port, encoder_input_port, &state.encoder_connection);
     if (status != MMAL_SUCCESS)
     {
         state.encoder_connection = NULL;
-        vcos_log_error("%s: Failed to connect camera video port to splitter input", __func__);
+        vcos_log_error("%s: Failed to connect camera video port to video encoder input", __func__);
         // goto error;
     }
-    printf("Connecting splitter output port 0 to video encoder input port\n");
-    status = connect_ports(splitter_output_port, encoder_input_port, &state.encoder_connection);
-    if (status != MMAL_SUCCESS)
-    {
-        state.encoder_connection = NULL;
-        vcos_log_error("%s: Failed to connect splitter output port 0 to video encoder input", __func__);
-        // goto error;
-    }
-    printf("Connecting splitter output port 1 to image encoder input port\n");
-    status = connect_ports(splitter_image_port, encoder_input_port_image, &state.encoder_connection_image);
-    if (status != MMAL_SUCCESS)
-    {
-        state.encoder_connection_image = NULL;
-        vcos_log_error("%s: Failed to connect splitter output port 1 to image encoder input", __func__);
-        // goto error;
-    }
-    
-    printf("Camera, splitter and encoder components are created and connected!\n");
+
+    printf("Camera and encoder components are created and connected!\n");
     // Ждём некоторое время для стабилизации камеры после соединений
     vcos_sleep(state.timeout_image);
+
+    if (state.camera_component->is_enabled)
+    {
+        printf("SEEMS LEGIT\n");
+    }
+
     // Настройка потоков для работы с видео и фотографиями
     int rc1, rc2;
     pthread_t video_thread, photo_thread;
@@ -2857,39 +2840,27 @@ int main(int argc, const char **argv)
     // Disable all our ports that are not handled by connections
     check_disable_port(camera_still_port);
     check_disable_port(encoder_output_port);
-    check_disable_port(encoder_output_port_image);
+    // check_disable_port(encoder_output_port_image);
     // check_disable_port(splitter_output_port);
 
     if (state.encoder_connection)
         mmal_connection_destroy(state.encoder_connection);
-    if (state.resizer_connection)
-        mmal_connection_destroy(state.resizer_connection);
-    if (state.splitter_connection)
-        mmal_connection_destroy(state.splitter_connection);
-    if (state.encoder_connection_image)
-        mmal_connection_destroy(state.encoder_connection_image);
+    // if (state.encoder_connection_image)
+    //     mmal_connection_destroy(state.encoder_connection_image);
 
     /* Disable components */
     if (state.encoder_component)
         mmal_component_disable(state.encoder_component);
 
-    if (state.encoder_component_image)
-        mmal_component_disable(state.encoder_component_image);
-
-    if (state.resize_component)
-        mmal_component_disable(state.resize_component);
-
-    if (state.splitter_component)
-        mmal_component_disable(state.splitter_component);
+    // if (state.encoder_component_image)
+    //     mmal_component_disable(state.encoder_component_image);
 
     if (state.camera_component)
         mmal_component_disable(state.camera_component);
 
     destroy_encoder_component(&state);
-    destroy_encoder_component_image(&state);
+    // destroy_encoder_component_image(&state);
     raspipreview_destroy(&state.preview_parameters);
-    destroy_resize_component(&state);
-    destroy_splitter_component(&state);
     destroy_camera_component(&state);
 
     gpioTerminate();
