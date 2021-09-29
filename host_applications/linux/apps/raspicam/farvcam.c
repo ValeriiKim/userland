@@ -2424,7 +2424,7 @@ void *video_routine(void *state_arg)
         if (gpioRead(23) == PI_OFF)
         {
             usleep(50*1000);
-            sprintf(video_name, "video_%d.h264", video_num);
+            sprintf(video_name, "usbdisk.d/video_%d.h264", video_num);
             strncpy(state->common_settings.filename, video_name, max_filename_length);
             start_recording(state);
             while (gpioRead(23) == PI_OFF)
@@ -2678,7 +2678,7 @@ void *photo_routine(void *state_arg)
                     memcpy(reserve_package, package, 6 + data_length - package_max_id * (package_size - 6));
 
                     // сохраняем фотографию на диске для отладки
-                    sprintf(state->jpeg_filename, "photo_%d.jpeg", photo_num);
+                    sprintf(state->jpeg_filename, "usbdisk.d/photo_%d.jpeg", photo_num);
                     // strncpy(state->jpeg_filename, "test_pic.jpeg", max_filename_length);
                     output_file = fopen(state->jpeg_filename, "wb");
                     fwrite(data, 1, data_length, output_file); // здесь записываем только реальное количество байт
