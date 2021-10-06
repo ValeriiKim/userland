@@ -71,7 +71,7 @@ target_link_libraries(raspistill ${MMAL_LIBS} vcos bcm_host ${EGL_LIBS} m dl)
 target_link_libraries(raspiyuv   ${MMAL_LIBS} vcos bcm_host m)
 target_link_libraries(raspivid   ${MMAL_LIBS} vcos bcm_host m)
 target_link_libraries(raspividyuv   ${MMAL_LIBS} vcos bcm_host m)
-target_link_libraries(farvcam ${MMAL_LIBS} vcos bcm_host m ${pigpio_LIBRARY})
+target_link_libraries(farvcam ${MMAL_LIBS} vcos bcm_host m rt ${pigpio_LIBRARY})
 
 install(TARGETS raspistill raspiyuv raspivid raspividyuv farvcam RUNTIME DESTINATION bin)
 install(FILES raspistill.1 raspiyuv.1 raspivid.1 raspividyuv.1 DESTINATION man/man1)

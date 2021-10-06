@@ -80,6 +80,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdbool.h>
 #include <pthread.h>
 #include <termios.h>
+#include <sys/ioctl.h>
 #include <fcntl.h>
 #include "pigpio.h"
 
@@ -100,8 +101,10 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 // Video format information
 // 0 implies variable
-#define VIDEO_FRAME_RATE_NUM 30
+#define VIDEO_FRAME_RATE_NUM 25
 #define VIDEO_FRAME_RATE_DEN 1
+
+#define VIDEO_DURATION_SEC 300   // 5 minutes
 
 /// Video render needs at least 2 buffers.
 #define VIDEO_OUTPUT_BUFFERS_NUM 3
@@ -109,12 +112,15 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define MAX_USER_EXIF_TAGS 32
 #define MAX_EXIF_PAYLOAD_LENGTH 128
 
+#define PIN_VIDEO 23
+#define PIN_RUNNING 24
+
 // Max bitrate we allow for recording
 const int MAX_BITRATE_MJPEG = 25000000;   // 25Mbits/s
 const int MAX_BITRATE_LEVEL4 = 25000000;  // 25Mbits/s
 const int MAX_BITRATE_LEVEL42 = 62500000; // 62.5Mbits/s
 
-const int max_filename_length = 30;
+const int max_filename_length = 50;
 
 /// Interval at which we check for an failure abort during capture
 const int ABORT_INTERVAL = 100; // ms
@@ -2399,6 +2405,7 @@ void cropRGB(uint8_t *input_image, int input_w, int input_h,
     free(rowBuffer);
 }
 
+
 /** Функция вызываемая потоком для записи и сохранения видео.
  * @param state_arg указатель на структуру state
  * @return NULL
@@ -2408,28 +2415,24 @@ void *video_routine(void *state_arg)
     RASPIVID_STATE *state = (RASPIVID_STATE *)state_arg;
     char video_name[max_filename_length];
     int video_num = 0;
-    gpioInitialise();
-    gpioSetMode(23, PI_INPUT);
-    gpioSetPullUpDown(23, PI_PUD_UP);
     state->common_settings.filename = malloc(max_filename_length);
-    // В терминале включённое состояние порта соответствует PI_OFF!
-    while (gpioRead(23) == PI_OFF)
+    struct timespec start_time, end_time;
+    
+    while (gpioRead(PIN_RUNNING) == PI_OFF)
     {
-        // Ничего не делаем. Ждём пока пользователь не выключит выход
-        // Запись должна начинаться после перехода из состояния ВЫКЛ в состояние ВКЛ
-    }
-    while (1)
-    {
-        // пока выход снова не включен, ничего не делаем
-        if (gpioRead(23) == PI_OFF)
+        // если выход для управления камерой включен, записываем видео по 5 минут
+        if (gpioRead(PIN_VIDEO) == PI_OFF)
         {
-            usleep(50*1000);
+            usleep(50*1000); // нужно немного подождать, потому что есть небольшой дребезг
             sprintf(video_name, "usbdisk.d/video_%d.h264", video_num);
             strncpy(state->common_settings.filename, video_name, max_filename_length);
             start_recording(state);
-            while (gpioRead(23) == PI_OFF)
+            clock_gettime(CLOCK_MONOTONIC, &start_time);
+            // printf("Start time = %u seconds\n", (unsigned int) start_time.tv_sec);	
+            while ((gpioRead(PIN_VIDEO) == PI_OFF) && (end_time.tv_sec - start_time.tv_sec < 20) && (gpioRead(PIN_RUNNING) == PI_OFF))
             {
-                // ждём пока выход не отключится
+                // ждём пока выход не отключится, не истечет время (5 минут) или не получен сигнал на выключение расберри 
+                clock_gettime(CLOCK_MONOTONIC, &end_time);
             }
             stop_recording(state);
             video_num++;
@@ -2501,6 +2504,7 @@ void *photo_routine(void *state_arg)
     float w_to_h;
     // переменная, запускающая цикл ожидания и обработки запроса
     int running = 1;
+    int bytes_in_buf; 
 
     FILE *output_file = NULL;
     state->jpeg_filename = malloc(max_filename_length);
@@ -2516,8 +2520,13 @@ void *photo_routine(void *state_arg)
     }
     serial_setup(fd, &old_serial, &new_serial);
     printf("Starting communication routine\n");
-    while (running)
+    while (gpioRead(PIN_RUNNING) == PI_OFF)
     {
+        ioctl(fd, FIONREAD, &bytes_in_buf); // определяем сколько байт в буфере последовательного порта
+        if (bytes_in_buf == 0) // эта проверка нужна, чтобы прерывать цикл, если первый цифровой выход терминала выключен
+        {
+            continue;
+        }
         int res = read(fd, buffer, 6);
         // printf("Number of received bytes: %d \n", res);
         commID = buffer[1];
@@ -2836,6 +2845,17 @@ int main(int argc, const char **argv)
     printf("Camera, splitter and encoder components are created and connected!\n");
     // Ждём некоторое время для стабилизации камеры после соединений
     vcos_sleep(state.timeout_image);
+    // Настройка портов для управления камерой
+    gpioInitialise();
+    gpioSetMode(PIN_VIDEO, PI_INPUT);
+    gpioSetPullUpDown(PIN_VIDEO, PI_PUD_UP);
+    gpioSetMode(PIN_RUNNING, PI_INPUT);
+    gpioSetPullUpDown(PIN_RUNNING, PI_PUD_UP);
+    // В терминале ВКЛЮЧЁННОЕ состояние порта соответствует PI_OFF!
+    while (gpioRead(PIN_RUNNING) == PI_ON)
+    {
+        // Ждём пока пользователь не включит камеру с помощью цифрового выхода терминала
+    }
     // Настройка потоков для работы с видео и фотографиями
     int rc1, rc2;
     pthread_t video_thread, photo_thread;
