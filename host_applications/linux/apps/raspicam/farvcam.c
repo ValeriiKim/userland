@@ -104,7 +104,10 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define VIDEO_FRAME_RATE_NUM 25
 #define VIDEO_FRAME_RATE_DEN 1
 
+// Настройки записи видео и фото
 #define VIDEO_DURATION_SEC 300   // 5 minutes
+#define MAX_NUM_OF_VIDEOS 50
+#define MAX_NUM_OF_PHOTOS 100
 
 /// Video render needs at least 2 buffers.
 #define VIDEO_OUTPUT_BUFFERS_NUM 3
@@ -1493,7 +1496,7 @@ static void destroy_splitter_component(RASPIVID_STATE *state)
     // Get rid of any port buffers first
     if (state->splitter_pool)
     {
-        mmal_port_pool_destroy(state->splitter_component->output[SPLITTER_OUTPUT_PORT], state->splitter_pool);
+        mmal_port_pool_destroy(state->splitter_component->output[0], state->splitter_pool);
     }
 
     if (state->splitter_component)
@@ -2161,7 +2164,7 @@ int start_recording(RASPIVID_STATE *state)
     int status;
     MMAL_PORT_T *camera_video_port = state->camera_component->output[MMAL_CAMERA_VIDEO_PORT];
     MMAL_PORT_T *encoder_output_port = state->encoder_component->output[0];
-    MMAL_PORT_T *splitter_output_port = state->splitter_component->output[SPLITTER_OUTPUT_PORT];
+    MMAL_PORT_T *splitter_output_port = state->splitter_component->output[0];
     MMAL_PORT_T *encoder_input_port = state->encoder_component->input[0];
     if (!state->encoder_connection->is_enabled)
     {
@@ -2405,6 +2408,18 @@ void cropRGB(uint8_t *input_image, int input_w, int input_h,
     free(rowBuffer);
 }
 
+/** Функция возвращающая текущий номер медиафайла, который нужно сохранить
+ * @param file указатель на файл
+ * @return номер файла, который нужно будет сохранять
+ * */
+int get_last_media_num(FILE *file)
+{
+    int num;
+    fseek(file, 5, SEEK_SET);
+    fscanf(file, "%d", &num);
+    fseek(file, 0, SEEK_SET);
+    return num;
+}
 
 /** Функция вызываемая потоком для записи и сохранения видео.
  * @param state_arg указатель на структуру state
@@ -2417,18 +2432,27 @@ void *video_routine(void *state_arg)
     int video_num = 0;
     state->common_settings.filename = malloc(max_filename_length);
     struct timespec start_time, end_time;
-    
+    FILE *video_log; // текстовый файл, в котором записан номер видео, которое надо записать
+    if ((video_log = fopen("video_log.txt", "r+")) == NULL)
+    {
+        printf("Error opening file!\n");
+        return NULL;
+    }
     while (gpioRead(PIN_RUNNING) == PI_OFF)
     {
         // если выход для управления камерой включен, записываем видео по 5 минут
         if (gpioRead(PIN_VIDEO) == PI_OFF)
         {
             usleep(50*1000); // нужно немного подождать, потому что есть небольшой дребезг
+            video_num = get_last_media_num(video_log);
+            if (video_num > 5)
+            {
+                video_num = 1;
+            }
             sprintf(video_name, "usbdisk.d/video_%d.h264", video_num);
             strncpy(state->common_settings.filename, video_name, max_filename_length);
             start_recording(state);
             clock_gettime(CLOCK_MONOTONIC, &start_time);
-            // printf("Start time = %u seconds\n", (unsigned int) start_time.tv_sec);	
             while ((gpioRead(PIN_VIDEO) == PI_OFF) && (end_time.tv_sec - start_time.tv_sec < 20) && (gpioRead(PIN_RUNNING) == PI_OFF))
             {
                 // ждём пока выход не отключится, не истечет время (5 минут) или не получен сигнал на выключение расберри 
@@ -2436,9 +2460,11 @@ void *video_routine(void *state_arg)
             }
             stop_recording(state);
             video_num++;
+            fprintf(video_log, "video%3d", video_num);
         }
     }
     free(state->common_settings.filename);
+    fclose(video_log);
     return NULL;
 }
 
@@ -2505,8 +2531,8 @@ void *photo_routine(void *state_arg)
     // переменная, запускающая цикл ожидания и обработки запроса
     int running = 1;
     int bytes_in_buf; 
-
-    FILE *output_file = NULL;
+    FILE *output_file = NULL; // файл, в который записывается изображение
+    FILE *photo_log; // текстовый файл, в котором записан номер фото, которое надо сохранить
     state->jpeg_filename = malloc(max_filename_length);
     int photo_num = 0;
 
@@ -2519,6 +2545,11 @@ void *photo_routine(void *state_arg)
         return -1;
     }
     serial_setup(fd, &old_serial, &new_serial);
+    if ((photo_log = fopen("photo_log.txt", "r+")) == NULL)
+    {
+        printf("Error opening file!\n");
+        return NULL;
+    }
     printf("Starting communication routine\n");
     while (gpioRead(PIN_RUNNING) == PI_OFF)
     {
@@ -2686,14 +2717,19 @@ void *photo_routine(void *state_arg)
                     reserve_size = package_size;
                     memcpy(reserve_package, package, 6 + data_length - package_max_id * (package_size - 6));
 
-                    // сохраняем фотографию на диске для отладки
+                    // сохраняем фотографию на диске (перезаписываем файлы, если превысили предел)
+                    photo_num = get_last_media_num(photo_log);
+                    if (photo_num > 5)
+                    {
+                        photo_num = 1;
+                    }
                     sprintf(state->jpeg_filename, "usbdisk.d/photo_%d.jpeg", photo_num);
-                    // strncpy(state->jpeg_filename, "test_pic.jpeg", max_filename_length);
                     output_file = fopen(state->jpeg_filename, "wb");
                     fwrite(data, 1, data_length, output_file); // здесь записываем только реальное количество байт
                     fclose(output_file);
                     output_file = NULL;
                     photo_num++;
+                    fprintf(photo_log, "photo%3d", photo_num);
                     // сбрасываем указатель
                     ptr = NULL;
                     // освобождаем память, динамически выделенную для хранения изображения
@@ -2713,23 +2749,7 @@ void *photo_routine(void *state_arg)
     }
     tcsetattr(fd, TCSANOW, &old_serial);
     close(fd);
-
-    // FILE *output_file = NULL;
-    // state->jpeg_filename = malloc(max_filename_length);
-    // unsigned int length_oversized = getImageBufferSize(state);
-    // uint8_t *data = malloc(length_oversized * sizeof(uint8_t));
-    // unsigned int length_actual;
-
-    // printf("START\n");
-    // usleep(2 * 1000000);
-    // strncpy(state->jpeg_filename, "test_1.jpeg", max_filename_length);
-    // output_file = fopen(state->jpeg_filename, "wb");
-    // take_picture(state, data, length_oversized, &length_actual);
-    // fwrite(data, 1, length_actual, output_file); // здесь записываем только реальное количество байт
-    // fclose(output_file);
-    // output_file = NULL;
-    // memset(data, 0, length_oversized);
-    // free(data);
+    
     free(state->jpeg_filename);
     return NULL;
 }
@@ -2809,7 +2829,7 @@ int main(int argc, const char **argv)
     encoder_output_port = state.encoder_component->output[0];
 
     splitter_input_port = state.splitter_component->input[0];
-    splitter_output_port = state.splitter_component->output[SPLITTER_OUTPUT_PORT];
+    splitter_output_port = state.splitter_component->output[0];
     splitter_image_port = state.splitter_component->output[1];
 
     encoder_input_port_image = state.encoder_component_image->input[0];

@@ -86,6 +86,6 @@ find_package_handle_standard_args(pigpio
     pigpio_INCLUDE_DIR pigpio_LIBRARY pigpiod_if_LIBRARY pigpiod_if2_LIBRARY)
 ```
 Далее этот файл нужно поместить в директорию `cmake` папки rootfs, `$HOME/Projects/raspberrypi/rootfs/usr/local/lib/cmake/`.
-При этом есть вероятность, что собрать проект всё равно не удастся. Тогда нужно удалить все файлы в `build` и попробовать снова. Если ошибок нет, то следует далее ввести команду `make -j`, находясь в папке `build`.
+При этом есть вероятность, что собрать проект всё равно не удастся. Тогда нужно удалить все файлы в `build` и попробовать снова. Если ошибок нет, то следует далее ввести команду `make farvcam`, находясь в папке `build`.
 
 В VScode с расширением CMake необходимо выбрать цель (target) `farvcam` и затем нажать `Build`. При этом `CMake` может поругаться, что не может найти `pigpio`, тогда нужно в VScode нажать `Сtrl+Shift+P` и выбрать `CMake: Clean`, после чего попробовать снова собрать проект.
