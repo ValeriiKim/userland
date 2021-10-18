@@ -93,10 +93,10 @@ find_package_handle_standard_args(pigpio
 
 ## Краткое описание работы программы `farvcam.c`
 Большая часть кода написана на базе библиотеки `MMAL`. В программе используются следующие компоненты `MMAL`:
-1. `MMAL_COMPONENT_DEFAULT_CAMERA`
-2. `MMAL_COMPONENT_DEFAULT_SPLITTER`
-3. `MMAL_COMPONENT_DEFAULT_IMAGE_ENCODER`
-4. `MMAL_COMPONENT_DEFAULT_VIDEO_ENCODER` 
+1. `MMAL_COMPONENT_DEFAULT_CAMERA`,  
+2. `MMAL_COMPONENT_DEFAULT_SPLITTER`,  
+3. `MMAL_COMPONENT_DEFAULT_IMAGE_ENCODER`,  
+4. `MMAL_COMPONENT_DEFAULT_VIDEO_ENCODER`,   
 Схема соединений этих компонентов показана на рисунке ниже. Этот подход взят из библиотеки `picamera`: [picamera docs](https://picamera.readthedocs.io/en/release-1.13/).
 
 ![Схема соединений MMAL компонентов](https://raw.githubusercontent.com/ValeriiKim/userland/testing/docs/%D0%A1%D0%BE%D0%B5%D0%B4%D0%B8%D0%BD%D0%B5%D0%BD%D0%B8%D1%8F%20MMAL%20%D0%BA%D0%BE%D0%BC%D0%BF%D0%BE%D0%BD%D0%B5%D0%BD%D1%82%D0%BE%D0%B2%20%D0%B2%20%D0%BF%D1%80%D0%BE%D0%B3%D1%80%D0%B0%D0%BC%D0%BC%D0%B5.png)
